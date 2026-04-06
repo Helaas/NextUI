@@ -77,6 +77,11 @@ extern uint32_t THEME_COLOR6;
 extern uint32_t THEME_COLOR7;
 extern SDL_Color ALT_BUTTON_TEXT_COLOR;
 
+// Shared libretro HW-render state used by minarch producers and GL consumers.
+extern int hw_render_enabled;
+extern GLuint hw_fbo_texture;
+extern int hw_render_bottom_left_origin;
+
 typedef struct {
 	float ratio;
     int buffer_free;
@@ -213,6 +218,8 @@ typedef struct GFX_Renderer {
 	int dst_w;
 	int dst_h;
 	int dst_p;
+
+	int hw_frame; // nonzero when frame is HW-rendered (texture already on GPU)
 } GFX_Renderer;
 
 typedef struct
@@ -658,6 +665,7 @@ scaler_t PLAT_getScaler(GFX_Renderer* renderer);
 void PLAT_blitRenderer(GFX_Renderer* renderer);
 void PLAT_flip(SDL_Surface* screen, int sync);
 void PLAT_GL_Swap();
+void PLAT_GL_BindSharedContext(int enable);
 void GFX_GL_Swap();
 unsigned char* PLAT_GL_screenCapture(int* outWidth, int* outHeight);
 void PLAT_setClearColor(uint32_t color);

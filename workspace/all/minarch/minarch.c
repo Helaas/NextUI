@@ -110,6 +110,15 @@ static int shader_reset_suppressed = 0;
 GFX_Renderer renderer;
 
 ///////////////////////////////////////
+// HW-render (libretro GL core) state
+///////////////////////////////////////
+static struct retro_hw_render_callback *hw_render_cb = NULL;
+static GLuint hw_fbo = 0;
+static GLuint hw_fbo_depth = 0;
+static int hw_fbo_width = 0;
+static int hw_fbo_height = 0;
+
+///////////////////////////////////////
 
 static struct Core {
 	int initialized;
@@ -4489,6 +4498,217 @@ static bool set_rumble_state(unsigned port, enum retro_rumble_effect effect, uin
 	VIB_setStrength(strength);
 	return 1;
 }
+
+///////////////////////////////////////
+// HW-render (libretro GL core) helpers
+///////////////////////////////////////
+
+static uintptr_t hw_get_current_framebuffer(void) {
+	return (uintptr_t)hw_fbo;
+}
+
+static retro_proc_address_t hw_get_proc_address(const char *sym) {
+	return (retro_proc_address_t)SDL_GL_GetProcAddress(sym);
+}
+
+static int hw_extensions_contain(const char *extensions, const char *needle) {
+	return extensions && needle && strstr(extensions, needle) != NULL;
+}
+
+static int hw_fbo_prefers_rgba8888(void) {
+	const char *extensions = (const char *)glGetString(GL_EXTENSIONS);
+	if (!extensions) {
+		return 1;
+	}
+
+	return hw_extensions_contain(extensions, "GL_OES_rgb8_rgba8")
+		|| hw_extensions_contain(extensions, "GL_ARM_rgba8");
+}
+
+static int hw_debug_sample_framebuffer(GLuint framebuffer, unsigned width, unsigned height,
+	unsigned char sample_rgba[5][4]) {
+	static const float sample_positions[5][2] = {
+		{0.50f, 0.50f},
+		{0.25f, 0.25f},
+		{0.75f, 0.25f},
+		{0.25f, 0.75f},
+		{0.75f, 0.75f},
+	};
+	GLint previous_fbo = 0;
+	int nonzero_samples = 0;
+	int i;
+
+	if (!width || !height) {
+		memset(sample_rgba, 0, sizeof(unsigned char) * 5 * 4);
+		return 0;
+	}
+
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous_fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+	for (i = 0; i < 5; i++) {
+		GLint x = (GLint)(sample_positions[i][0] * (float)(width - 1));
+		GLint y = (GLint)(sample_positions[i][1] * (float)(height - 1));
+		glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sample_rgba[i]);
+		if (sample_rgba[i][0] || sample_rgba[i][1] || sample_rgba[i][2] || sample_rgba[i][3]) {
+			nonzero_samples++;
+		}
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)previous_fbo);
+	return nonzero_samples;
+}
+
+static void hw_debug_log_fbo_sample(const char *tag, unsigned width, unsigned height) {
+	static int sample_logs = 0;
+	unsigned char fbo_samples[5][4];
+	unsigned char screen_samples[5][4];
+	int fbo_nonzero;
+	int screen_nonzero;
+
+	if (sample_logs >= 8 || !hw_fbo || !width || !height) {
+		return;
+	}
+
+	fbo_nonzero = hw_debug_sample_framebuffer(hw_fbo, width, height, fbo_samples);
+	screen_nonzero = hw_debug_sample_framebuffer(0, width, height, screen_samples);
+
+	LOG_info("HW-render sample %d (%s): fbo_nonzero=%d screen_nonzero=%d fbo_center=%u,%u,%u,%u screen_center=%u,%u,%u,%u size=%ux%u\n",
+		sample_logs + 1, tag,
+		fbo_nonzero, screen_nonzero,
+		fbo_samples[0][0], fbo_samples[0][1], fbo_samples[0][2], fbo_samples[0][3],
+		screen_samples[0][0], screen_samples[0][1], screen_samples[0][2], screen_samples[0][3],
+		width, height);
+
+	if (!fbo_nonzero && screen_nonzero && hw_fbo_texture) {
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glBindTexture(GL_TEXTURE_2D, hw_fbo_texture);
+		glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
+		LOG_warn("HW-render fallback: copied framebuffer 0 into hw_fbo_texture\n");
+	}
+	sample_logs++;
+}
+
+static void hw_fbo_delete_objects(GLuint *fbo, GLuint *texture, GLuint *depth) {
+	if (*texture) {
+		glDeleteTextures(1, texture);
+		*texture = 0;
+	}
+	if (*depth) {
+		glDeleteRenderbuffers(1, depth);
+		*depth = 0;
+	}
+	if (*fbo) {
+		glDeleteFramebuffers(1, fbo);
+		*fbo = 0;
+	}
+}
+
+static int hw_fbo_try_create(int width, int height,
+	GLenum color_internal_format, GLenum color_format, GLenum color_type,
+	const char **color_label, const char **depth_label) {
+	GLuint next_fbo = 0;
+	GLuint next_texture = 0;
+	GLuint next_depth = 0;
+	GLenum status;
+	int wants_depth = hw_render_cb && hw_render_cb->depth;
+	int wants_stencil = hw_render_cb && hw_render_cb->stencil;
+
+	glGenTextures(1, &next_texture);
+	glBindTexture(GL_TEXTURE_2D, next_texture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexImage2D(GL_TEXTURE_2D, 0, color_internal_format, width, height, 0, color_format, color_type, NULL);
+
+	if (wants_depth) {
+		glGenRenderbuffers(1, &next_depth);
+		glBindRenderbuffer(GL_RENDERBUFFER, next_depth);
+		glRenderbufferStorage(GL_RENDERBUFFER,
+			wants_stencil ? GL_DEPTH24_STENCIL8 : GL_DEPTH_COMPONENT16,
+			width, height);
+	}
+
+	glGenFramebuffers(1, &next_fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, next_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, next_texture, 0);
+
+	if (wants_depth) {
+		if (wants_stencil) {
+			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, next_depth);
+			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, next_depth);
+		} else {
+			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, next_depth);
+		}
+	}
+
+	status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	if (status != GL_FRAMEBUFFER_COMPLETE) {
+		LOG_warn("HW-render FBO init failed with %s/%s: 0x%x\n",
+			color_internal_format == GL_RGBA ? "RGBA8888" : "RGB565",
+			wants_depth ? (wants_stencil ? "depth24-stencil8" : "depth16") : "none",
+			status);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glBindRenderbuffer(GL_RENDERBUFFER, 0);
+		glBindTexture(GL_TEXTURE_2D, 0);
+		hw_fbo_delete_objects(&next_fbo, &next_texture, &next_depth);
+		return 0;
+	}
+
+	hw_fbo = next_fbo;
+	hw_fbo_texture = next_texture;
+	hw_fbo_depth = next_depth;
+	hw_fbo_width = width;
+	hw_fbo_height = height;
+
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glBindRenderbuffer(GL_RENDERBUFFER, 0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	*color_label = color_internal_format == GL_RGBA ? "RGBA8888" : "RGB565";
+	*depth_label = wants_depth ? (wants_stencil ? "depth24-stencil8" : "depth16") : "none";
+	return 1;
+}
+
+static void hw_fbo_ensure(int width, int height) {
+	const char *color_label = "unknown";
+	const char *depth_label = "none";
+	int prefer_rgba8888;
+
+	if (hw_fbo && hw_fbo_width == width && hw_fbo_height == height)
+		return;
+
+	// Tear down old FBO objects
+	hw_fbo_delete_objects(&hw_fbo, &hw_fbo_texture, &hw_fbo_depth);
+	hw_fbo_width = 0;
+	hw_fbo_height = 0;
+
+	prefer_rgba8888 = hw_fbo_prefers_rgba8888();
+	if (prefer_rgba8888) {
+		if (!hw_fbo_try_create(width, height, GL_RGBA, GL_RGBA, GL_UNSIGNED_BYTE, &color_label, &depth_label)) {
+			hw_fbo_try_create(width, height, GL_RGB, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, &color_label, &depth_label);
+		}
+	} else {
+		if (!hw_fbo_try_create(width, height, GL_RGB, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, &color_label, &depth_label)) {
+			hw_fbo_try_create(width, height, GL_RGBA, GL_RGBA, GL_UNSIGNED_BYTE, &color_label, &depth_label);
+		}
+	}
+
+	if (!hw_fbo || !hw_fbo_texture) {
+		LOG_error("HW-render FBO creation failed for %dx%d\n", width, height);
+		return;
+	}
+
+	LOG_info("HW-render FBO created: %dx%d (fbo=%u tex=%u depth=%u color=%s depth_mode=%s)\n",
+		width, height, hw_fbo, hw_fbo_texture, hw_fbo_depth, color_label, depth_label);
+}
+
+static void hw_fbo_destroy(void) {
+	if (hw_fbo_texture) { glDeleteTextures(1, &hw_fbo_texture); hw_fbo_texture = 0; }
+	if (hw_fbo_depth)   { glDeleteRenderbuffers(1, &hw_fbo_depth); hw_fbo_depth = 0; }
+	if (hw_fbo)         { glDeleteFramebuffers(1, &hw_fbo); hw_fbo = 0; }
+	hw_fbo_width = hw_fbo_height = 0;
+}
+
 static bool environment_callback(unsigned cmd, void *data) { // copied from picoarch initially
 	// LOG_info("environment_callback: %i\n", cmd);
 	
@@ -4865,13 +5085,37 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
 		LOG_info("Core requested GL context type: %d, version %d.%d\n", 
 			cb->context_type, cb->version_major, cb->version_minor);
 
+		// Reject unsupported context types (Vulkan, D3D, etc.)
+		switch (cb->context_type) {
+		case RETRO_HW_CONTEXT_OPENGLES2:
+		case RETRO_HW_CONTEXT_OPENGLES3:
+		case RETRO_HW_CONTEXT_OPENGLES_VERSION:
+		case RETRO_HW_CONTEXT_OPENGL:
+		case RETRO_HW_CONTEXT_OPENGL_CORE:
+			break;
+		default:
+			LOG_info("Unsupported HW context type %d, rejecting\n", cb->context_type);
+			return false;
+		}
+
 		// Fallback if version is 0.0 or other unexpected values
 		if (cb->context_type == 4 && cb->version_major == 0 && cb->version_minor == 0) {
-			LOG_info("Core requested invalid GL context type or version, defaulting to GLES 2.0\n");
+			LOG_info("Core requested invalid GL context type or version, defaulting to GLES 3.0\n");
 			cb->context_type = RETRO_HW_CONTEXT_OPENGLES3;
 			cb->version_major = 3;
 			cb->version_minor = 0;
 		}
+
+		// Wire up the callbacks the core needs
+		cb->get_current_framebuffer = hw_get_current_framebuffer;
+		cb->get_proc_address = hw_get_proc_address;
+
+		hw_render_cb = cb;
+		hw_render_enabled = 1;
+		hw_render_bottom_left_origin = cb->bottom_left_origin;
+
+		LOG_info("HW-render enabled (bottom_left_origin=%d, depth=%d, stencil=%d)\n",
+			cb->bottom_left_origin, cb->depth, cb->stencil);
 
 		return true;
 	}
@@ -5718,6 +5962,11 @@ static void drawDebugHud(const void* data, unsigned width, unsigned height, size
 
 static void video_refresh_callback_main(const void *data, unsigned width, unsigned height, size_t pitch) {
 	// return;
+	int restore_shared_context = hw_render_enabled;
+
+	if (restore_shared_context) {
+		PLAT_GL_BindSharedContext(0);
+	}
 
 	Special_render();
 	
@@ -5727,7 +5976,12 @@ static void video_refresh_callback_main(const void *data, unsigned width, unsign
 	// 14 will let GB hit 10x but NES and SNES will drop to 1.5x at 30fps (not sure why)
 	// but 10 hurts PS...
 	// TODO: 10 was based on rg35xx, probably different results on other supported platforms
-	if (fast_forward && SDL_GetTicks()-last_flip_time<10) return;
+	if (fast_forward && SDL_GetTicks()-last_flip_time<10) {
+		if (restore_shared_context) {
+			PLAT_GL_BindSharedContext(1);
+		}
+		return;
+	}
 	
 	// FFVII menus 
 	// 16: 30/200
@@ -5738,13 +5992,18 @@ static void video_refresh_callback_main(const void *data, unsigned width, unsign
 	//  8: 60/210 (with optimize text off)
 	// eg. PS@10 60/240
 	if (!data) {
+		if (restore_shared_context) {
+			PLAT_GL_BindSharedContext(1);
+		}
 		return;
 	}
+
+	int is_hw_frame = (hw_render_enabled && data == RETRO_HW_FRAME_BUFFER_VALID);
 
 	// if source has changed size (or forced by dst_p==0)
 	// eg. true src + cropped src + fixed dst + cropped dst
 	if (renderer.dst_p==0 || width!=renderer.true_w || height!=renderer.true_h) {
-		selectScaler(width, height, pitch);
+		selectScaler(width, height, is_hw_frame ? width * 4 : pitch);
 		GFX_clearAll();
 		if (!shader_reset_suppressed) {
 			GFX_resetShaders();
@@ -5752,22 +6011,34 @@ static void video_refresh_callback_main(const void *data, unsigned width, unsign
 			shader_reset_suppressed = 0; // consume suppression after one use
 		}
 	}
-	
-	// debug
-	drawDebugHud(data, width, height, pitch, fmt);
-	
-	static int frame_counter = 0;
-	const int max_frames = 8; 
-	if(frame_counter<9) {
-		applyFadeIn((uint32_t **) &data, pitch, width, height, &frame_counter, max_frames);
-	}
 
-	renderer.src = (void*)data;
+	if (is_hw_frame) {
+		// HW-rendered: pixels are already on the GPU in hw_fbo_texture.
+		// Skip CPU-side debug HUD and fade-in (they need pixel access).
+		renderer.src = NULL;
+		renderer.hw_frame = 1;
+	} else {
+		// debug
+		drawDebugHud(data, width, height, pitch, fmt);
+		
+		static int frame_counter = 0;
+		const int max_frames = 8; 
+		if(frame_counter<9) {
+			applyFadeIn((uint32_t **) &data, pitch, width, height, &frame_counter, max_frames);
+		}
+
+		renderer.src = (void*)data;
+		renderer.hw_frame = 0;
+	}
 	renderer.dst = screen->pixels;
 	GFX_blitRenderer(&renderer);
 
 	screen_flip(screen);
 	last_flip_time = SDL_GetTicks();
+
+	if (restore_shared_context) {
+		PLAT_GL_BindSharedContext(1);
+	}
 }
 
 const void* lastframe = NULL;
@@ -5942,6 +6213,26 @@ static void video_refresh_callback(const void* data, unsigned width, unsigned he
 		}
 	}
 
+	// HW-rendered frame (e.g. GL core): data == RETRO_HW_FRAME_BUFFER_VALID = (void*)-1.
+	// There is no CPU-accessible pixel buffer to convert — pass straight through.
+	if (hw_render_enabled && data == RETRO_HW_FRAME_BUFFER_VALID) {
+		// Ensure FBO matches the core's current output size
+		hw_fbo_ensure(width, height);
+		hw_debug_log_fbo_sample("valid", width, height);
+		video_refresh_callback_main(data, width, height, pitch);
+		return;
+	}
+
+	// HW core can also pass NULL to mean "reuse previous frame".
+	// For HW cores the previous texture persists on the GPU, so just re-composite.
+	if (hw_render_enabled && !data) {
+		if (hw_fbo_texture) {
+			hw_debug_log_fbo_sample("reuse", width, height);
+			video_refresh_callback_main(RETRO_HW_FRAME_BUFFER_VALID, width, height, 0);
+		}
+		return;
+	}
+
 	// Handle NULL data by reusing last frame
 	if (!data) {
 		data = lastframe;
@@ -5953,7 +6244,7 @@ static void video_refresh_callback(const void* data, unsigned width, unsigned he
 		} else {
 			convert_rgb565_to_rgba(data, rgbaData, width, height, pitch);
 		}
-		
+
 		data = rgbaData;
 		lastframe = data;
 	}
@@ -8865,6 +9156,18 @@ static void limitFF(void) {
 	last_time = now;
 }
 
+static void core_run_with_hw_context(void) {
+	if (!hw_render_enabled) {
+		core.run();
+		return;
+	}
+
+	PLAT_GL_BindSharedContext(1);
+	core.run();
+	glFinish();
+	PLAT_GL_BindSharedContext(0);
+}
+
 static void run_frame(void) {
 	// if rewind is toggled, fast-forward toggle must stay off; fast-forward hold pauses rewind
 	int do_rewind = (rewind_pressed || rewind_toggle) && !(rewind_toggle && ff_hold_active);
@@ -8875,7 +9178,7 @@ static void run_frame(void) {
 			// Actually stepped back - run one frame to render the restored state
 			rewinding = 1;
 			fast_forward = 0;
-			core.run();
+			core_run_with_hw_context();
 		}
 		else if (rewind_result == REWIND_STEP_CADENCE) {
 			// Waiting for cadence - don't run core, just re-render current frame
@@ -8904,7 +9207,7 @@ static void run_frame(void) {
 					Rewind_sync_encode_state();
 				}
 				rewinding = 0;
-				core.run();
+				core_run_with_hw_context();
 				Rewind_push(0);
 			}
 		}
@@ -8918,7 +9221,7 @@ static void run_frame(void) {
 			ff_paused_by_rewind_hold = 0;
 		}
 
-		core.run();
+		core_run_with_hw_context();
 		Rewind_push(0);
 	}
 	limitFF();
@@ -9034,6 +9337,18 @@ int main(int argc , char* argv[]) {
 	// ah, because it's defined before options_menu...
 	options_menu.items[1].desc = (char*)core.version;
 	Core_load();
+
+	// HW-render: create FBO and trigger the core's context_reset callback
+	if (hw_render_enabled && hw_render_cb) {
+		PLAT_GL_BindSharedContext(1);
+		// Create the initial FBO at a default size; will be resized on first frame
+		hw_fbo_ensure(640, 480);
+		if (hw_render_cb->context_reset)
+			hw_render_cb->context_reset();
+		glFinish();
+		PLAT_GL_BindSharedContext(0);
+		LOG_info("HW-render: context_reset called\n");
+	}
 	
 	Input_init(NULL);
 	Config_readOptions(); // but others load and report options later (eg. nes)
@@ -9193,6 +9508,19 @@ finish:
 	Game_close();
 	Rewind_free();
 	Core_unload();
+
+	// HW-render: call context_destroy and free FBO before tearing down GL
+	if (hw_render_enabled && hw_render_cb) {
+		PLAT_GL_BindSharedContext(1);
+		if (hw_render_cb->context_destroy)
+			hw_render_cb->context_destroy();
+		hw_fbo_destroy();
+		glFinish();
+		PLAT_GL_BindSharedContext(0);
+		hw_render_enabled = 0;
+		hw_render_cb = NULL;
+	}
+
 	Core_quit();
 	Core_close();
 	Config_quit();

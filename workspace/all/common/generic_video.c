@@ -34,6 +34,8 @@
 static int finalScaleFilter=GL_LINEAR;
 static int reloadShaderTextures = 1;
 static int shaderResetRequested = 0;
+static int externalGLStateDirty = 0;
+static int hw_mainctx_debug_logs = 0;
 
 static SDL_BlendMode getPremultipliedBlendMode(void) {
 	return SDL_ComposeCustomBlendMode(
@@ -102,6 +104,7 @@ static struct VID_Context {
 	SDL_Texture* overlay;
 	SDL_Surface* screen;
 	SDL_GLContext gl_context;
+	SDL_GLContext shared_gl_context;
 
 	GFX_Renderer* blit; // yeesh
 	int width;
@@ -116,9 +119,74 @@ static int device_height;
 static int device_pitch;
 static uint32_t SDL_transparentBlack = 0;
 
+static int ensureSharedGLContext(void) {
+	if (vid.shared_gl_context) {
+		return 1;
+	}
+	if (!vid.window || !vid.gl_context) {
+		return 0;
+	}
+
+	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+	SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+	vid.shared_gl_context = SDL_GL_CreateContext(vid.window);
+	SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+
+	if (!vid.shared_gl_context) {
+		LOG_warn("Failed to create shared GL context: %s\n", SDL_GetError());
+		return 0;
+	}
+
+	return 1;
+}
+
+void PLAT_GL_BindSharedContext(int enable) {
+	if (!vid.window || !vid.gl_context) {
+		return;
+	}
+
+	if (enable) {
+		if (!ensureSharedGLContext()) {
+			SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+			return;
+		}
+		SDL_GL_MakeCurrent(vid.window, vid.shared_gl_context);
+	} else {
+		SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+	}
+}
+
 #define OVERLAYS_FOLDER SDCARD_PATH "/Overlays"
 
 static char* overlay_path = NULL;
+
+static void debug_hw_texture_in_main_context(GLuint texture, int width, int height) {
+	if (!texture || hw_mainctx_debug_logs >= 8 || width <= 0 || height <= 0) {
+		return;
+	}
+
+	GLuint debug_fbo = 0;
+	GLenum status = 0;
+	unsigned char pixel[4] = {0, 0, 0, 0};
+	GLboolean is_texture = glIsTexture(texture);
+	GLint previous_fbo = 0;
+
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous_fbo);
+	glGenFramebuffers(1, &debug_fbo);
+	glBindFramebuffer(GL_FRAMEBUFFER, debug_fbo);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+	status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	if (status == GL_FRAMEBUFFER_COMPLETE) {
+		glReadPixels(width / 2, height / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)previous_fbo);
+	glDeleteFramebuffers(1, &debug_fbo);
+
+	LOG_info("HW-render mainctx %d: tex=%u is_texture=%d fbo_status=0x%x sample=%u,%u,%u,%u size=%dx%d\n",
+		hw_mainctx_debug_logs + 1, texture, is_texture ? 1 : 0, status,
+		pixel[0], pixel[1], pixel[2], pixel[3], width, height);
+	hw_mainctx_debug_logs++;
+}
 
 // Notification overlay state for RA achievements
 typedef struct {
@@ -752,6 +820,10 @@ void PLAT_quitVideo(void) {
 	vid.renderer = NULL;
 
 	// Drop current context and delete
+	if (vid.shared_gl_context) {
+		SDL_GL_DeleteContext(vid.shared_gl_context);
+		vid.shared_gl_context = NULL;
+	}
 	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
 	SDL_GL_MakeCurrent(NULL, NULL);
 	SDL_GL_DeleteContext(vid.gl_context);
@@ -1611,6 +1683,12 @@ void PLAT_flip(SDL_Surface* IGNORED, int ignored) {
         return;
     }
 
+    // HW-rendered frames have no CPU pixel buffer — use the GL shader path (PLAT_GL_Swap) instead
+    if (vid.blit->hw_frame) {
+        PLAT_GL_Swap();
+        return;
+    }
+
     SDL_UpdateTexture(vid.stream_layer1, NULL, vid.blit->src, vid.blit->src_p);
 
     SDL_Texture* target = vid.stream_layer1;
@@ -1654,6 +1732,7 @@ void runShaderPass(GLuint src_texture, GLuint shader_program, GLuint* target_tex
 	static GLint max_tex_size = 0;
 	static int logged_bad_size = 0;
 	GLenum pre_err;
+	int force_state_rebind = externalGLStateDirty;
 
 	while ((pre_err = glGetError()) != GL_NO_ERROR) {
 		(void)pre_err;
@@ -1684,11 +1763,26 @@ void runShaderPass(GLuint src_texture, GLuint shader_program, GLuint* target_tex
 		last_bound_texture = 0;
 	}
 
+	if (force_state_rebind) {
+		// A HW-rendered core can leave arbitrary GL state behind after retro_run().
+		// Invalidate our caches and restore the bits our fullscreen pass depends on.
+		last_program = 0;
+		last_bound_texture = 0;
+		last_texelSize[0] = last_texelSize[1] = -1.0f;
+		glActiveTexture(GL_TEXTURE0);
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_DEPTH_TEST);
+		glDisable(GL_STENCIL_TEST);
+		glDisable(GL_SCISSOR_TEST);
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+		externalGLStateDirty = 0;
+	}
+
 	texelSize[0] = 1.0f / shader->texw;
 	texelSize[1] = 1.0f / shader->texh;
 
 
-	if (shader_program != last_program)
+	if (shader_program != last_program || force_state_rebind)
     	glUseProgram(shader_program);
 
 	if (static_VAO == 0) {
@@ -1708,7 +1802,7 @@ void runShaderPass(GLuint src_texture, GLuint shader_program, GLuint* target_tex
 		glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
 	}
 
-	if (shader_program != last_program) {
+	if (shader_program != last_program || force_state_rebind) {
 		GLint posAttrib = glGetAttribLocation(shader_program, "VertexCoord");
 		if (posAttrib >= 0) {
 			glVertexAttribPointer(posAttrib, 4, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
@@ -1906,6 +2000,7 @@ int prepareFrameThread(void *data) {
 static SDL_Thread *prepare_thread = NULL;
 
 void PLAT_GL_Swap() {
+	static int hw_swap_debug_logs = 0;
 
 	//uint64_t performance_frequency = SDL_GetPerformanceFrequency();
 	//uint64_t frame_start = SDL_GetPerformanceCounter();
@@ -1929,11 +2024,18 @@ void PLAT_GL_Swap() {
     SDL_Rect dst_rect = {0, 0, device_width, device_height};
     setRectToAspectRatio(&dst_rect);
 
-    if (!vid.blit->src) {
+    if (!vid.blit->src && !vid.blit->hw_frame) {
         return;
     }
 
 	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+
+	// After HW core rendering, ensure the default framebuffer is active
+	// so the shader pipeline draws to screen, not to the core's FBO.
+	if (vid.blit->hw_frame) {
+		externalGLStateDirty = 1;
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	}
 
 	static GLuint effect_tex = 0;
 	static int effect_w = 0, effect_h = 0;
@@ -2031,28 +2133,40 @@ void PLAT_GL_Swap() {
 		pthread_mutex_unlock(&video_prep_mutex);
     }
 
-	if (!src_texture || reloadShaderTextures) {
-        // if (src_texture) {
-        //     glDeleteTextures(1, &src_texture);
-        //     src_texture = 0;
-        // }
-		if (src_texture==0)
-        	glGenTextures(1, &src_texture);
-        glBindTexture(GL_TEXTURE_2D, src_texture);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, nrofshaders > 0 ? shaders[0]->filter : finalScaleFilter);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, nrofshaders > 0 ? shaders[0]->filter : finalScaleFilter);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    }
+	GLuint effective_src_texture = 0;
+	GLuint final_shader = g_shader_default;
 
-    glBindTexture(GL_TEXTURE_2D, src_texture);
-    if (vid.blit->src_w != src_w_last || vid.blit->src_h != src_h_last || reloadShaderTextures) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, vid.blit->src_w, vid.blit->src_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, vid.blit->src);
-        src_w_last = vid.blit->src_w;
-        src_h_last = vid.blit->src_h;
-    } else {
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vid.blit->src_w, vid.blit->src_h, GL_RGBA, GL_UNSIGNED_BYTE, vid.blit->src);
-    }
+	if (vid.blit->hw_frame && hw_fbo_texture) {
+		// HW-rendered frame: the core already drew into hw_fbo_texture.
+		// Use it directly as the source — skip CPU pixel upload entirely.
+		// FBO-backed libretro frames with bottom_left_origin already use GL-style
+		// texture orientation, so the default CPU-frame vertical flip shader is wrong.
+		effective_src_texture = hw_fbo_texture;
+		debug_hw_texture_in_main_context(hw_fbo_texture, vid.blit->src_w, vid.blit->src_h);
+		final_shader = hw_render_bottom_left_origin ? g_noshader : g_shader_default;
+		src_w_last = vid.blit->src_w;
+		src_h_last = vid.blit->src_h;
+	} else {
+		if (!src_texture || reloadShaderTextures) {
+			if (src_texture==0)
+				glGenTextures(1, &src_texture);
+			glBindTexture(GL_TEXTURE_2D, src_texture);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, nrofshaders > 0 ? shaders[0]->filter : finalScaleFilter);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, nrofshaders > 0 ? shaders[0]->filter : finalScaleFilter);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		}
+
+		glBindTexture(GL_TEXTURE_2D, src_texture);
+		if (vid.blit->src_w != src_w_last || vid.blit->src_h != src_h_last || reloadShaderTextures) {
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, vid.blit->src_w, vid.blit->src_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, vid.blit->src);
+			src_w_last = vid.blit->src_w;
+			src_h_last = vid.blit->src_h;
+		} else {
+			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, vid.blit->src_w, vid.blit->src_h, GL_RGBA, GL_UNSIGNED_BYTE, vid.blit->src);
+		}
+		effective_src_texture = src_texture;
+	}
 
     last_w = vid.blit->src_w;
     last_h = vid.blit->src_h;
@@ -2100,7 +2214,7 @@ void PLAT_GL_Swap() {
         if (shaders[i]->shader_p) {
 			//LOG_info("Shader Pass: Pipeline step %d/%d\n", i + 1, nrofshaders);
             runShaderPass(
-                (i == 0) ? src_texture : shaders[i - 1]->texture,
+                (i == 0) ? effective_src_texture : shaders[i - 1]->texture,
                 shaders[i]->shader_p,
                 &shaders[i]->texture,
                 0, 0, dst_w, dst_h,
@@ -2110,7 +2224,7 @@ void PLAT_GL_Swap() {
             );
         } else {
             runShaderPass(
-                (i == 0) ? src_texture : shaders[i - 1]->texture,
+                (i == 0) ? effective_src_texture : shaders[i - 1]->texture,
                 g_noshader,
                 &shaders[i]->texture,
                 0, 0, dst_w, dst_h,
@@ -2128,7 +2242,7 @@ void PLAT_GL_Swap() {
 		//LOG_info("Shader Pass: Scale to screen (pipeline size: %d)\n", nrofshaders);
         runShaderPass(
             shaders[nrofshaders - 1]->texture,
-            g_shader_default,
+            final_shader,
             NULL,
             dst_rect.x, dst_rect.y, dst_rect.w, dst_rect.h,
             &(Shader){.srcw = last_w, .srch = last_h, .texw = last_w, .texh = last_h},
@@ -2137,8 +2251,8 @@ void PLAT_GL_Swap() {
     }
 	else {
 		//LOG_info("Shader Pass: Scale to screen (pipeline size: %d)\n", nrofshaders);
-        runShaderPass(src_texture,
-			g_shader_default,
+        runShaderPass(effective_src_texture,
+			final_shader,
 			NULL,
 			dst_rect.x, dst_rect.y, dst_rect.w, dst_rect.h,
             &(Shader){.srcw = vid.blit->src_w, .srch = vid.blit->src_h, .texw = vid.blit->src_w, .texh = vid.blit->src_h},
@@ -2186,6 +2300,15 @@ void PLAT_GL_Swap() {
             1, GL_NONE
         );
     }
+
+	if (vid.blit->hw_frame && hw_swap_debug_logs < 8) {
+		unsigned char pixel[4] = {0, 0, 0, 0};
+		glReadPixels(device_width / 2, device_height / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+		LOG_info("HW-render swap %d: src_tex=%u dst_rect=%d,%d %dx%d bottom_left=%d screen=%u,%u,%u,%u\n",
+			hw_swap_debug_logs + 1, effective_src_texture, dst_rect.x, dst_rect.y, dst_rect.w, dst_rect.h,
+			hw_render_bottom_left_origin, pixel[0], pixel[1], pixel[2], pixel[3]);
+		hw_swap_debug_logs++;
+	}
 
 	SDL_GL_SwapWindow(vid.window);
 

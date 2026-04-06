@@ -215,6 +215,10 @@ int currentshadertexh = 0;
 
 int should_rotate = 0;
 
+int hw_render_enabled = 0;
+GLuint hw_fbo_texture = 0;
+int hw_render_bottom_left_origin = 0;
+
 FALLBACK_IMPLEMENTATION void PLAT_pinToCores(int core_type)
 {
 	// no-op
@@ -4394,3 +4398,4 @@ FALLBACK_IMPLEMENTATION void PLAT_bluetoothStreamEnd() {}
 FALLBACK_IMPLEMENTATION void PLAT_bluetoothStreamQuit() {}
 FALLBACK_IMPLEMENTATION int PLAT_bluetoothVolume() { return 100; }
 FALLBACK_IMPLEMENTATION void PLAT_bluetoothSetVolume(int vol) {}
+FALLBACK_IMPLEMENTATION void PLAT_GL_BindSharedContext(int enable) { (void)enable; }
