@@ -65,7 +65,7 @@ enum {
 #define REWIND_ENTRY_SIZE_HINT 4096           // assumed avg entry size for capacity calc
 #define REWIND_MIN_ENTRIES 8                  // minimum entry table size
 #define REWIND_POOL_SIZE_SMALL 3              // capture pool size for small states
-#define REWIND_POOL_SIZE_LARGE 4              // capture pool size for large states
+#define REWIND_POOL_SIZE_LARGE 2              // capture pool size for large states (double-buffer)
 #define REWIND_LARGE_STATE_THRESHOLD (2*1024*1024)  // 2MB threshold for pool sizing
 #define REWIND_MAX_BUFFER_MB 256              // max rewind buffer size
 #define REWIND_MAX_LZ4_ACCELERATION 64        // max LZ4 acceleration value
@@ -1041,7 +1041,10 @@ static int State_read(void) { // from picoarch
 	  goto error;
 	}
 
-	if (!core.unserialize(state, state_size)) {
+	if (hw_render_enabled) PLAT_GL_BindSharedContext(1);
+	int unser_ok = core.unserialize(state, state_size);
+	if (hw_render_enabled) PLAT_GL_BindSharedContext(0);
+	if (!unser_ok) {
 	  LOG_error("Error restoring save state: %s\n", filename);
 	  goto error;
 	}
@@ -1076,7 +1079,10 @@ error:
 		goto error;
 	}
 
-	if (!core.unserialize(state, state_size)) {
+	if (hw_render_enabled) PLAT_GL_BindSharedContext(1);
+	int unser_ok2 = core.unserialize(state, state_size);
+	if (hw_render_enabled) PLAT_GL_BindSharedContext(0);
+	if (!unser_ok2) {
 		LOG_error("Error restoring save state: %s\n", filename);
 		goto error;
 	}
@@ -1111,7 +1117,10 @@ static int State_write(void) { // from picoarch
 		goto error;
 	}
 
-	if (!core.serialize(state, state_size)) {
+	if (hw_render_enabled) PLAT_GL_BindSharedContext(1);
+	int ser_ok = core.serialize(state, state_size);
+	if (hw_render_enabled) PLAT_GL_BindSharedContext(0);
+	if (!ser_ok) {
 		LOG_error("Error serializing save state\n");
 		goto error;
 	}
@@ -1789,7 +1798,10 @@ static void Rewind_push(int force) {
 		}
 
 		uint8_t *buf = rewind_ctx.capture_pool[slot];
-		if (!core.serialize(buf, rewind_ctx.state_size)) {
+		if (hw_render_enabled) PLAT_GL_BindSharedContext(1);
+		int rser2 = core.serialize(buf, rewind_ctx.state_size);
+		if (hw_render_enabled) PLAT_GL_BindSharedContext(0);
+		if (!rser2) {
 			LOG_error("Rewind: serialize failed\n");
 			pthread_mutex_lock(&rewind_ctx.queue_mx);
 			rewind_ctx.capture_busy[slot] = 0;
@@ -1810,7 +1822,10 @@ static void Rewind_push(int force) {
 	}
 
 	// synchronous fallback (thread not available)
-	if (!core.serialize(rewind_ctx.state_buf, rewind_ctx.state_size)) {
+	if (hw_render_enabled) PLAT_GL_BindSharedContext(1);
+	int rser3 = core.serialize(rewind_ctx.state_buf, rewind_ctx.state_size);
+	if (hw_render_enabled) PLAT_GL_BindSharedContext(0);
+	if (!rser3) {
 		LOG_error("Rewind: serialize failed\n");
 		return;
 	}
@@ -1935,7 +1950,10 @@ static int Rewind_step_back(void) {
 		return REWIND_STEP_EMPTY;
 	}
 
-	if (!core.unserialize(rewind_ctx.state_buf, rewind_ctx.state_size)) {
+	if (hw_render_enabled) PLAT_GL_BindSharedContext(1);
+	int runser = core.unserialize(rewind_ctx.state_buf, rewind_ctx.state_size);
+	if (hw_render_enabled) PLAT_GL_BindSharedContext(0);
+	if (!runser) {
 		LOG_error("Rewind: unserialize failed\n");
 		Rewind_drop_oldest_locked();
 		pthread_mutex_unlock(&rewind_ctx.lock);
@@ -5965,6 +5983,7 @@ static void video_refresh_callback_main(const void *data, unsigned width, unsign
 	int restore_shared_context = hw_render_enabled;
 
 	if (restore_shared_context) {
+		glFlush(); // submit FBO rendering commands before switching to main context
 		PLAT_GL_BindSharedContext(0);
 	}
 
@@ -6264,7 +6283,7 @@ static void video_refresh_callback(const void* data, unsigned width, unsigned he
 static void audio_sample_callback(int16_t left, int16_t right) {
 	if (rewinding && !rewind_ctx.audio) return;
 	if (!fast_forward || ff_audio) {
-		if (use_core_fps || fast_forward) {
+		if (use_core_fps || fast_forward || hw_render_enabled) {
 			SND_batchSamples_fixed_rate(&(const SND_Frame){left,right}, 1);
 		}
 		else {
@@ -6272,10 +6291,10 @@ static void audio_sample_callback(int16_t left, int16_t right) {
 		}
 	}
 }
-static size_t audio_sample_batch_callback(const int16_t *data, size_t frames) { 
+static size_t audio_sample_batch_callback(const int16_t *data, size_t frames) {
 	if (rewinding && !rewind_ctx.audio) return frames;
 	if (!fast_forward || ff_audio) {
-		if (use_core_fps || fast_forward) {
+		if (use_core_fps || fast_forward || hw_render_enabled) {
 			return SND_batchSamples_fixed_rate((const SND_Frame*)data, frames);
 		}
 		else {
@@ -9163,8 +9182,7 @@ static void core_run_with_hw_context(void) {
 	}
 
 	PLAT_GL_BindSharedContext(1);
-	core.run();
-	glFinish();
+	core.run(); // video callback inside will glFlush + switch context + SDL_GL_SwapWindow (vsync)
 	PLAT_GL_BindSharedContext(0);
 }
 
