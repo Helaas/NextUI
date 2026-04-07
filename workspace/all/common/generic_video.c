@@ -1627,7 +1627,8 @@ void setRectToAspectRatio(SDL_Rect* dst_rect) {
 
 void PLAT_blitRenderer(GFX_Renderer* renderer) {
 	vid.blit = renderer;
-	SDL_RenderClear(vid.renderer);
+	if (!renderer->hw_frame)
+		SDL_RenderClear(vid.renderer);
 	resizeVideo(vid.blit->true_w,vid.blit->true_h,vid.blit->src_p);
 }
 
@@ -2142,7 +2143,6 @@ void PLAT_GL_Swap() {
 		// FBO-backed libretro frames with bottom_left_origin already use GL-style
 		// texture orientation, so the default CPU-frame vertical flip shader is wrong.
 		effective_src_texture = hw_fbo_texture;
-		debug_hw_texture_in_main_context(hw_fbo_texture, vid.blit->src_w, vid.blit->src_h);
 		final_shader = hw_render_bottom_left_origin ? g_noshader : g_shader_default;
 		src_w_last = vid.blit->src_w;
 		src_h_last = vid.blit->src_h;
@@ -2300,15 +2300,6 @@ void PLAT_GL_Swap() {
             1, GL_NONE
         );
     }
-
-	if (vid.blit->hw_frame && hw_swap_debug_logs < 8) {
-		unsigned char pixel[4] = {0, 0, 0, 0};
-		glReadPixels(device_width / 2, device_height / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
-		LOG_info("HW-render swap %d: src_tex=%u dst_rect=%d,%d %dx%d bottom_left=%d screen=%u,%u,%u,%u\n",
-			hw_swap_debug_logs + 1, effective_src_texture, dst_rect.x, dst_rect.y, dst_rect.w, dst_rect.h,
-			hw_render_bottom_left_origin, pixel[0], pixel[1], pixel[2], pixel[3]);
-		hw_swap_debug_logs++;
-	}
 
 	SDL_GL_SwapWindow(vid.window);
 
