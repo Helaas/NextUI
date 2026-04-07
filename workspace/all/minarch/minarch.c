@@ -1743,57 +1743,10 @@ static void Rewind_push(int force) {
 				pthread_mutex_unlock(&rewind_ctx.queue_mx);
 				break;
 			}
-			// No free slot: synchronously process the oldest queued capture to preserve ordering
-			if (rewind_ctx.queue_count > 0) {
-				int queued_slot = rewind_ctx.queue[rewind_ctx.queue_head];
-				unsigned int gen = rewind_ctx.capture_gen[queued_slot];
-				rewind_ctx.queue_head = (rewind_ctx.queue_head + 1) % rewind_ctx.queue_capacity;
-				rewind_ctx.queue_count -= 1;
-				pthread_mutex_unlock(&rewind_ctx.queue_mx);
-
-				size_t dest_len = rewind_ctx.scratch_size;
-				int is_keyframe = 1;
-				pthread_mutex_lock(&rewind_ctx.lock);
-				if (gen == rewind_ctx.generation) {
-					int res = Rewind_compress_state(rewind_ctx.capture_pool[queued_slot], &dest_len, &is_keyframe);
-					if (res == 0) {
-						Rewind_write_entry_locked(rewind_ctx.scratch, dest_len, is_keyframe);
-					} else {
-						LOG_error("Rewind: compression failed (%i)\n", res);
-					}
-				}
-				pthread_mutex_unlock(&rewind_ctx.lock);
-
-				pthread_mutex_lock(&rewind_ctx.queue_mx);
-				rewind_ctx.capture_busy[queued_slot] = 0;
-				rewind_ctx.free_stack[rewind_ctx.free_count++] = queued_slot;
-				pthread_mutex_unlock(&rewind_ctx.queue_mx);
-				// loop again to try to grab a free slot for the current frame
-				continue;
-			}
+			// No free slot: skip this capture rather than blocking the main
+			// thread with synchronous compression (critical for large states
+			// like N64 where LZ4 of 16 MB would stall the game loop).
 			pthread_mutex_unlock(&rewind_ctx.queue_mx);
-			break;
-		}
-
-		if (slot < 0) {
-			// worker is busy; fall back to synchronous capture so we don't miss cadence
-			if (!core.serialize(rewind_ctx.state_buf, rewind_ctx.state_size)) {
-				LOG_error("Rewind: serialize failed (sync fallback)\n");
-				return;
-			}
-
-			size_t dest_len = rewind_ctx.scratch_size;
-			int is_keyframe = 1;
-			pthread_mutex_lock(&rewind_ctx.lock);
-			int res = Rewind_compress_state(rewind_ctx.state_buf, &dest_len, &is_keyframe);
-			if (res != 0) {
-				pthread_mutex_unlock(&rewind_ctx.lock);
-				LOG_error("Rewind: compression failed (sync fallback) (%i)\n", res);
-				return;
-			}
-
-			Rewind_write_entry_locked(rewind_ctx.scratch, dest_len, is_keyframe);
-			pthread_mutex_unlock(&rewind_ctx.lock);
 			return;
 		}
 
