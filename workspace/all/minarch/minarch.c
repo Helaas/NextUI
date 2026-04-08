@@ -117,6 +117,7 @@ static GLuint hw_fbo = 0;
 static GLuint hw_fbo_depth = 0;
 static int hw_fbo_width = 0;
 static int hw_fbo_height = 0;
+static int hw_render_uses_screen = 0; // Set when core renders to FB 0 instead of the provided FBO
 
 ///////////////////////////////////////
 
@@ -4529,33 +4530,12 @@ static int hw_debug_sample_framebuffer(GLuint framebuffer, unsigned width, unsig
 }
 
 static void hw_debug_log_fbo_sample(const char *tag, unsigned width, unsigned height) {
-	static int sample_logs = 0;
-	unsigned char fbo_samples[5][4];
-	unsigned char screen_samples[5][4];
-	int fbo_nonzero;
-	int screen_nonzero;
-
-	if (sample_logs >= 8 || !hw_fbo || !width || !height) {
-		return;
-	}
-
-	fbo_nonzero = hw_debug_sample_framebuffer(hw_fbo, width, height, fbo_samples);
-	screen_nonzero = hw_debug_sample_framebuffer(0, width, height, screen_samples);
-
-	LOG_info("HW-render sample %d (%s): fbo_nonzero=%d screen_nonzero=%d fbo_center=%u,%u,%u,%u screen_center=%u,%u,%u,%u size=%ux%u\n",
-		sample_logs + 1, tag,
-		fbo_nonzero, screen_nonzero,
-		fbo_samples[0][0], fbo_samples[0][1], fbo_samples[0][2], fbo_samples[0][3],
-		screen_samples[0][0], screen_samples[0][1], screen_samples[0][2], screen_samples[0][3],
-		width, height);
-
-	if (!fbo_nonzero && screen_nonzero && hw_fbo_texture) {
-		glBindFramebuffer(GL_FRAMEBUFFER, 0);
-		glBindTexture(GL_TEXTURE_2D, hw_fbo_texture);
-		glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
-		LOG_warn("HW-render fallback: copied framebuffer 0 into hw_fbo_texture\n");
-	}
-	sample_logs++;
+	// Disabled: the glBindFramebuffer/glReadPixels calls in
+	// hw_debug_sample_framebuffer corrupt GL state for cores like GLideN64
+	// that maintain their own internal GL state cache.  The diagnostic
+	// confirmed that cores using the FBO correctly (fbo_nonzero > 0), so
+	// this sampling is no longer needed.
+	(void)tag; (void)width; (void)height;
 }
 
 static void hw_fbo_delete_objects(GLuint *fbo, GLuint *texture, GLuint *depth) {
@@ -6195,7 +6175,14 @@ static void video_refresh_callback(const void* data, unsigned width, unsigned he
 	if (hw_render_enabled && data == RETRO_HW_FRAME_BUFFER_VALID) {
 		// Ensure FBO matches the core's current output size
 		hw_fbo_ensure(width, height);
-		hw_debug_log_fbo_sample("valid", width, height);
+
+		// IMPORTANT: do NOT issue raw GL calls here — we are still in the
+		// core's shared GL context.  Cores like GLideN64 cache GL state
+		// internally; calling glBindFramebuffer/glReadPixels behind their
+		// back desynchronises their cache and causes crashes on the next frame.
+		// All diagnostic sampling and fallback copies happen after the
+		// context switch inside video_refresh_callback_main.
+
 		video_refresh_callback_main(data, width, height, pitch);
 		return;
 	}
@@ -6204,7 +6191,6 @@ static void video_refresh_callback(const void* data, unsigned width, unsigned he
 	// For HW cores the previous texture persists on the GPU, so just re-composite.
 	if (hw_render_enabled && !data) {
 		if (hw_fbo_texture) {
-			hw_debug_log_fbo_sample("reuse", width, height);
 			video_refresh_callback_main(RETRO_HW_FRAME_BUFFER_VALID, width, height, 0);
 		}
 		return;
@@ -9494,6 +9480,7 @@ finish:
 		glFinish();
 		PLAT_GL_BindSharedContext(0);
 		hw_render_enabled = 0;
+		hw_render_uses_screen = 0;
 		hw_render_cb = NULL;
 	}
 
