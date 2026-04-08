@@ -5921,12 +5921,15 @@ static void video_refresh_callback_main(const void *data, unsigned width, unsign
 	int restore_shared_context = hw_render_enabled;
 
 	if (restore_shared_context) {
+		LOG_info("HW-frame: pre-flush\n");
 		glFlush(); // submit FBO rendering commands before switching to main context
+		LOG_info("HW-frame: switching to main ctx\n");
 		PLAT_GL_BindSharedContext(0);
+		LOG_info("HW-frame: in main ctx\n");
 	}
 
 	Special_render();
-	
+
 	static uint32_t last_flip_time = 0;
 	
 	// 10 seems to be the sweet spot that allows 2x in NES and SNES and 8x in GB at 60fps
@@ -5974,6 +5977,7 @@ static void video_refresh_callback_main(const void *data, unsigned width, unsign
 		// Skip CPU-side debug HUD and fade-in (they need pixel access).
 		renderer.src = NULL;
 		renderer.hw_frame = 1;
+		LOG_info("HW-frame: pre-blit (tex=%u %ux%u)\n", hw_fbo_texture, width, height);
 	} else {
 		// debug
 		drawDebugHud(data, width, height, pitch, fmt);
@@ -5989,12 +5993,15 @@ static void video_refresh_callback_main(const void *data, unsigned width, unsign
 	}
 	renderer.dst = screen->pixels;
 	GFX_blitRenderer(&renderer);
+	if (is_hw_frame) LOG_info("HW-frame: post-blit, pre-flip\n");
 
 	screen_flip(screen);
+	if (is_hw_frame) LOG_info("HW-frame: post-flip\n");
 	last_flip_time = SDL_GetTicks();
 
 	if (restore_shared_context) {
 		PLAT_GL_BindSharedContext(1);
+		LOG_info("HW-frame: back to shared ctx\n");
 	}
 }
 
@@ -9120,14 +9127,19 @@ static void limitFF(void) {
 }
 
 static void core_run_with_hw_context(void) {
+	static int hw_frame_counter = 0;
 	if (!hw_render_enabled) {
 		core.run();
 		return;
 	}
 
+	if (hw_frame_counter < 5) LOG_info("HW-frame %d: bind shared ctx\n", hw_frame_counter);
 	PLAT_GL_BindSharedContext(1);
+	if (hw_frame_counter < 5) LOG_info("HW-frame %d: calling core.run()\n", hw_frame_counter);
 	core.run(); // video callback inside will glFlush + switch context + SDL_GL_SwapWindow (vsync)
+	if (hw_frame_counter < 5) LOG_info("HW-frame %d: core.run() returned, unbinding\n", hw_frame_counter);
 	PLAT_GL_BindSharedContext(0);
+	hw_frame_counter++;
 }
 
 static void run_frame(void) {
