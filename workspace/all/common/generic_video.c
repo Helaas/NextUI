@@ -35,6 +35,7 @@
 static int finalScaleFilter=GL_LINEAR;
 static int reloadShaderTextures = 1;
 static int shaderResetRequested = 0;
+static int externalGLStateDirty = 0;
 
 static SDL_BlendMode getPremultipliedBlendMode(void) {
 	return SDL_ComposeCustomBlendMode(
@@ -103,6 +104,7 @@ static struct VID_Context {
 	SDL_Texture* overlay;
 	SDL_Surface* screen;
 	SDL_GLContext gl_context;
+	SDL_GLContext shared_gl_context;
 
 	GFX_Renderer* blit; // yeesh
 	int width;
@@ -128,6 +130,43 @@ static int device_width;
 static int device_height;
 static int device_pitch;
 static uint32_t SDL_transparentBlack = 0;
+
+static int ensureSharedGLContext(void) {
+	if (vid.shared_gl_context) {
+		return 1;
+	}
+	if (!vid.window || !vid.gl_context) {
+		return 0;
+	}
+
+	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+	SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+	vid.shared_gl_context = SDL_GL_CreateContext(vid.window);
+	SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+
+	if (!vid.shared_gl_context) {
+		LOG_warn("Failed to create shared GL context: %s\n", SDL_GetError());
+		return 0;
+	}
+
+	return 1;
+}
+
+void PLAT_GL_BindSharedContext(int enable) {
+	if (!vid.window || !vid.gl_context) {
+		return;
+	}
+
+	if (enable) {
+		if (!ensureSharedGLContext()) {
+			SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+			return;
+		}
+		SDL_GL_MakeCurrent(vid.window, vid.shared_gl_context);
+	} else {
+		SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+	}
+}
 
 #define OVERLAYS_FOLDER SDCARD_PATH "/Overlays"
 
@@ -162,13 +201,23 @@ static void destroyCoreVideoTarget(void)
 
 bool PLAT_coreVideoEnsureTarget(unsigned width, unsigned height, bool depth, bool stencil)
 {
-	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+	// FBOs are per-context objects in OpenGL — they are NOT shared between
+	// contexts.  The core renders from the shared context, so the FBO must
+	// be created there.  Textures and renderbuffers ARE shared, so the
+	// compositor in the main context can still sample core_video.color_tex.
+	ensureSharedGLContext();
+	if (vid.shared_gl_context) {
+		SDL_GL_MakeCurrent(vid.window, vid.shared_gl_context);
+	} else {
+		SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+	}
 
 	if (core_video.fbo &&
 		core_video.width == width &&
 		core_video.height == height &&
 		core_video.depth == depth &&
 		core_video.stencil == stencil) {
+		SDL_GL_MakeCurrent(vid.window, vid.gl_context);
 		return true;
 	}
 
@@ -179,24 +228,28 @@ bool PLAT_coreVideoEnsureTarget(unsigned width, unsigned height, bool depth, boo
 
 	glGenTextures(1, &core_video.color_tex);
 	glBindTexture(GL_TEXTURE_2D, core_video.color_tex);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, core_video.color_tex, 0);
 
 	if (depth || stencil) {
+		GLenum depth_format = stencil ? GL_DEPTH24_STENCIL8 : GL_DEPTH_COMPONENT16;
 		glGenRenderbuffers(1, &core_video.depth_stencil_rbo);
 		glBindRenderbuffer(GL_RENDERBUFFER, core_video.depth_stencil_rbo);
-		glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+		glRenderbufferStorage(GL_RENDERBUFFER, depth_format, width, height);
 		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, core_video.depth_stencil_rbo);
-		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, core_video.depth_stencil_rbo);
+		if (stencil) {
+			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, core_video.depth_stencil_rbo);
+		}
 	}
 
 	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
 		destroyCoreVideoTarget();
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		SDL_GL_MakeCurrent(vid.window, vid.gl_context);
 		return false;
 	}
 
@@ -206,13 +259,20 @@ bool PLAT_coreVideoEnsureTarget(unsigned width, unsigned height, bool depth, boo
 	core_video.stencil = stencil;
 
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
 	return true;
 }
 
 void PLAT_coreVideoDestroy(void)
 {
-	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+	// FBO must be destroyed in the same context it was created in (shared).
+	if (vid.shared_gl_context) {
+		SDL_GL_MakeCurrent(vid.window, vid.shared_gl_context);
+	} else {
+		SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+	}
 	destroyCoreVideoTarget();
+	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
 }
 
 uintptr_t PLAT_coreVideoFramebuffer(void)
@@ -222,7 +282,6 @@ uintptr_t PLAT_coreVideoFramebuffer(void)
 
 void* PLAT_coreVideoProcAddress(const char *name)
 {
-	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
 	return SDL_GL_GetProcAddress(name);
 }
 
@@ -851,6 +910,10 @@ void PLAT_quitVideo(void) {
 	vid.renderer = NULL;
 
 	// Drop current context and delete
+	if (vid.shared_gl_context) {
+		SDL_GL_DeleteContext(vid.shared_gl_context);
+		vid.shared_gl_context = NULL;
+	}
 	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
 	SDL_GL_MakeCurrent(NULL, NULL);
 	SDL_GL_DeleteContext(vid.gl_context);
@@ -1654,7 +1717,8 @@ void setRectToAspectRatio(SDL_Rect* dst_rect) {
 
 void PLAT_blitRenderer(GFX_Renderer* renderer) {
 	vid.blit = renderer;
-	SDL_RenderClear(vid.renderer);
+	if (renderer->source_type != GFX_SOURCE_HW_TEXTURE)
+		SDL_RenderClear(vid.renderer);
 	resizeVideo(vid.blit->true_w,vid.blit->true_h,vid.blit->src_p);
 }
 
@@ -1679,8 +1743,12 @@ void PLAT_flipHidden() {
 
 
 void PLAT_flip(SDL_Surface* IGNORED, int ignored) {
-	// dont think we need this here tbh
-	// SDL_RenderClear(vid.renderer);
+	// HW-rendered frames have no CPU pixel buffer — use the GL shader path instead
+	if (vid.blit && vid.blit->source_type == GFX_SOURCE_HW_TEXTURE) {
+		PLAT_GL_Swap();
+		return;
+	}
+
 	if (!vid.blit) {
         resizeVideo(device_width, device_height, FIXED_PITCH); // !!!???
         SDL_UpdateTexture(vid.stream_layer1, NULL, vid.screen->pixels, vid.screen->pitch);
@@ -1775,6 +1843,8 @@ void runShaderPass(GLuint src_texture, GLuint shader_program, GLuint* target_tex
 		return;
 	}
 
+	int force_state_rebind = externalGLStateDirty;
+
 	if (shaderResetRequested) {
 		// Force rebuild of GL objects and cached state
 		if (static_VAO) { glDeleteVertexArrays(1, &static_VAO); static_VAO = 0; }
@@ -1785,11 +1855,26 @@ void runShaderPass(GLuint src_texture, GLuint shader_program, GLuint* target_tex
 		last_bound_texture = 0;
 	}
 
+	if (force_state_rebind) {
+		// A HW-rendered core can leave arbitrary GL state behind after retro_run().
+		// Invalidate our caches and restore the bits our fullscreen pass depends on.
+		last_program = 0;
+		last_bound_texture = 0;
+		last_texelSize[0] = last_texelSize[1] = -1.0f;
+		glActiveTexture(GL_TEXTURE0);
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_DEPTH_TEST);
+		glDisable(GL_STENCIL_TEST);
+		glDisable(GL_SCISSOR_TEST);
+		glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+		externalGLStateDirty = 0;
+	}
+
 	texelSize[0] = 1.0f / shader->texw;
 	texelSize[1] = 1.0f / shader->texh;
 
 
-	if (shader_program != last_program)
+	if (shader_program != last_program || force_state_rebind)
     	glUseProgram(shader_program);
 
 	if (static_VAO == 0 || last_flip_y != flip_y) {
@@ -1813,7 +1898,7 @@ void runShaderPass(GLuint src_texture, GLuint shader_program, GLuint* target_tex
 		last_flip_y = flip_y;
 	}
 
-	if (shader_program != last_program) {
+	if (shader_program != last_program || force_state_rebind) {
 		GLint posAttrib = glGetAttribLocation(shader_program, "VertexCoord");
 		if (posAttrib >= 0) {
 			glVertexAttribPointer(posAttrib, 4, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
@@ -2043,6 +2128,13 @@ void PLAT_GL_Swap() {
     }
 
 	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
+
+	// After HW core rendering, ensure the default framebuffer is active
+	// so the shader pipeline draws to screen, not to the core's FBO.
+	if (vid.blit->source_type == GFX_SOURCE_HW_TEXTURE) {
+		externalGLStateDirty = 1;
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	}
 
 	static GLuint effect_tex = 0;
 	static int effect_w = 0, effect_h = 0;

@@ -1051,7 +1051,10 @@ static int State_read(void) { // from picoarch
 	  goto error;
 	}
 
-	if (!core.unserialize(state, state_size)) {
+	if (hw_video.enabled) PLAT_GL_BindSharedContext(1);
+	int unser_ok = core.unserialize(state, state_size);
+	if (hw_video.enabled) PLAT_GL_BindSharedContext(0);
+	if (!unser_ok) {
 	  LOG_error("Error restoring save state: %s\n", filename);
 	  goto error;
 	}
@@ -1086,7 +1089,10 @@ error:
 		goto error;
 	}
 
-	if (!core.unserialize(state, state_size)) {
+	if (hw_video.enabled) PLAT_GL_BindSharedContext(1);
+	int unser_ok2 = core.unserialize(state, state_size);
+	if (hw_video.enabled) PLAT_GL_BindSharedContext(0);
+	if (!unser_ok2) {
 		LOG_error("Error restoring save state: %s\n", filename);
 		goto error;
 	}
@@ -1121,7 +1127,10 @@ static int State_write(void) { // from picoarch
 		goto error;
 	}
 
-	if (!core.serialize(state, state_size)) {
+	if (hw_video.enabled) PLAT_GL_BindSharedContext(1);
+	int ser_ok = core.serialize(state, state_size);
+	if (hw_video.enabled) PLAT_GL_BindSharedContext(0);
+	if (!ser_ok) {
 		LOG_error("Error serializing save state\n");
 		goto error;
 	}
@@ -1778,7 +1787,10 @@ static void Rewind_push(int force) {
 
 		if (slot < 0) {
 			// worker is busy; fall back to synchronous capture so we don't miss cadence
-			if (!core.serialize(rewind_ctx.state_buf, rewind_ctx.state_size)) {
+			if (hw_video.enabled) PLAT_GL_BindSharedContext(1);
+			int rser_sync = core.serialize(rewind_ctx.state_buf, rewind_ctx.state_size);
+			if (hw_video.enabled) PLAT_GL_BindSharedContext(0);
+			if (!rser_sync) {
 				LOG_error("Rewind: serialize failed (sync fallback)\n");
 				return;
 			}
@@ -1799,7 +1811,10 @@ static void Rewind_push(int force) {
 		}
 
 		uint8_t *buf = rewind_ctx.capture_pool[slot];
-		if (!core.serialize(buf, rewind_ctx.state_size)) {
+		if (hw_video.enabled) PLAT_GL_BindSharedContext(1);
+		int rser2 = core.serialize(buf, rewind_ctx.state_size);
+		if (hw_video.enabled) PLAT_GL_BindSharedContext(0);
+		if (!rser2) {
 			LOG_error("Rewind: serialize failed\n");
 			pthread_mutex_lock(&rewind_ctx.queue_mx);
 			rewind_ctx.capture_busy[slot] = 0;
@@ -1820,7 +1835,10 @@ static void Rewind_push(int force) {
 	}
 
 	// synchronous fallback (thread not available)
-	if (!core.serialize(rewind_ctx.state_buf, rewind_ctx.state_size)) {
+	if (hw_video.enabled) PLAT_GL_BindSharedContext(1);
+	int rser3 = core.serialize(rewind_ctx.state_buf, rewind_ctx.state_size);
+	if (hw_video.enabled) PLAT_GL_BindSharedContext(0);
+	if (!rser3) {
 		LOG_error("Rewind: serialize failed\n");
 		return;
 	}
@@ -1945,7 +1963,10 @@ static int Rewind_step_back(void) {
 		return REWIND_STEP_EMPTY;
 	}
 
-	if (!core.unserialize(rewind_ctx.state_buf, rewind_ctx.state_size)) {
+	if (hw_video.enabled) PLAT_GL_BindSharedContext(1);
+	int runser = core.unserialize(rewind_ctx.state_buf, rewind_ctx.state_size);
+	if (hw_video.enabled) PLAT_GL_BindSharedContext(0);
+	if (!runser) {
 		LOG_error("Rewind: unserialize failed\n");
 		Rewind_drop_oldest_locked();
 		pthread_mutex_unlock(&rewind_ctx.lock);
@@ -4901,12 +4922,6 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
 			return false;
 		}
 
-		if (!HWVideo_ensure_target(renderer.true_w, renderer.true_h)) {
-			LOG_error("Failed to allocate frontend HW render target\n");
-			MinarchHWVideo_reset(&hw_video);
-			return false;
-		}
-
 		return true;
 	}
 	case RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE:
@@ -5757,10 +5772,19 @@ static void present_frame(const void *rgba_frame, unsigned width, unsigned heigh
 	static uint32_t last_flip_time = 0;
 	static int frame_counter = 0;
 	const int max_frames = 8;
+	int restore_shared_context = is_hw_frame && hw_video.enabled;
+
+	if (restore_shared_context) {
+		glFlush(); // submit FBO rendering commands before switching to main context
+		PLAT_GL_BindSharedContext(0);
+	}
 
 	Special_render();
 
 	if (fast_forward && SDL_GetTicks() - last_flip_time < 10) {
+		if (restore_shared_context) {
+			PLAT_GL_BindSharedContext(1);
+		}
 		return;
 	}
 
@@ -5794,6 +5818,10 @@ static void present_frame(const void *rgba_frame, unsigned width, unsigned heigh
 	GFX_blitRenderer(&renderer);
 	screen_flip(screen);
 	last_flip_time = SDL_GetTicks();
+
+	if (restore_shared_context) {
+		PLAT_GL_BindSharedContext(1);
+	}
 }
 
 const void* lastframe = NULL;
@@ -5948,6 +5976,11 @@ static void video_refresh_callback(const void* data, unsigned width, unsigned he
 	}
 
 	if (hw_video.enabled && (data == RETRO_HW_FRAME_BUFFER_VALID || data == NULL)) {
+		static int hw_frame_count = 0;
+		if (hw_frame_count < 3) {
+			LOG_info("HW: video_refresh_callback frame #%d data=%p %ux%u\n", hw_frame_count, data, width, height);
+			hw_frame_count++;
+		}
 		if (data == RETRO_HW_FRAME_BUFFER_VALID) {
 			MinarchHWVideo_record_frame(&hw_video, width, height);
 		} else if (!hw_video.frame_ready) {
@@ -6014,7 +6047,7 @@ static void video_refresh_callback(const void* data, unsigned width, unsigned he
 static void audio_sample_callback(int16_t left, int16_t right) {
 	if (rewinding && !rewind_ctx.audio) return;
 	if (!fast_forward || ff_audio) {
-		if (use_core_fps || fast_forward) {
+		if (use_core_fps || fast_forward || hw_video.enabled) {
 			SND_batchSamples_fixed_rate(&(const SND_Frame){left,right}, 1);
 		}
 		else {
@@ -6022,10 +6055,10 @@ static void audio_sample_callback(int16_t left, int16_t right) {
 		}
 	}
 }
-static size_t audio_sample_batch_callback(const int16_t *data, size_t frames) { 
+static size_t audio_sample_batch_callback(const int16_t *data, size_t frames) {
 	if (rewinding && !rewind_ctx.audio) return frames;
 	if (!fast_forward || ff_audio) {
-		if (use_core_fps || fast_forward) {
+		if (use_core_fps || fast_forward || hw_video.enabled) {
 			return SND_batchSamples_fixed_rate((const SND_Frame*)data, frames);
 		}
 		else {
@@ -6191,7 +6224,13 @@ bool Core_load(void) {
 	if (hw_video.enabled &&
 		hw_video.callback.context_reset &&
 		MinarchHWVideo_take_context_reset_pending(&hw_video)) {
+		LOG_info("HW: FBO=%u tex=%u before context_reset\n",
+			(unsigned)PLAT_coreVideoFramebuffer(), (unsigned)PLAT_coreVideoTexture());
+		PLAT_GL_BindSharedContext(1);
 		hw_video.callback.context_reset();
+		glFinish();
+		PLAT_GL_BindSharedContext(0);
+		LOG_info("HW: context_reset complete\n");
 	}
 	return true;
 }
@@ -6214,7 +6253,10 @@ void Core_quit(void) {
 		Cheats_free();
 		RTC_write();
 		if (hw_video.enabled && hw_video.callback.context_destroy) {
+			PLAT_GL_BindSharedContext(1);
 			hw_video.callback.context_destroy();
+			glFinish();
+			PLAT_GL_BindSharedContext(0);
 		}
 		PLAT_coreVideoDestroy();
 		MinarchHWVideo_reset(&hw_video);
@@ -8937,6 +8979,25 @@ static void limitFF(void) {
 	last_time = now;
 }
 
+static void core_run_with_hw_context(void) {
+	static int hw_run_count = 0;
+	if (!hw_video.enabled) {
+		core.run();
+		return;
+	}
+
+	if (hw_run_count < 3) {
+		LOG_info("HW: core.run #%d start (FBO=%u)\n", hw_run_count, (unsigned)PLAT_coreVideoFramebuffer());
+	}
+	PLAT_GL_BindSharedContext(1);
+	core.run();
+	PLAT_GL_BindSharedContext(0);
+	if (hw_run_count < 3) {
+		LOG_info("HW: core.run #%d complete\n", hw_run_count);
+	}
+	hw_run_count++;
+}
+
 static void run_frame(void) {
 	// if rewind is toggled, fast-forward toggle must stay off; fast-forward hold pauses rewind
 	int do_rewind = (rewind_pressed || rewind_toggle) && !(rewind_toggle && ff_hold_active);
@@ -8947,7 +9008,7 @@ static void run_frame(void) {
 			// Actually stepped back - run one frame to render the restored state
 			rewinding = 1;
 			fast_forward = 0;
-			core.run();
+			core_run_with_hw_context();
 		}
 		else if (rewind_result == REWIND_STEP_CADENCE) {
 			// Waiting for cadence - don't run core, just re-render current frame
@@ -8976,7 +9037,7 @@ static void run_frame(void) {
 					Rewind_sync_encode_state();
 				}
 				rewinding = 0;
-				core.run();
+				core_run_with_hw_context();
 				Rewind_push(0);
 			}
 		}
@@ -8990,7 +9051,7 @@ static void run_frame(void) {
 			ff_paused_by_rewind_hold = 0;
 		}
 
-		core.run();
+		core_run_with_hw_context();
 		Rewind_push(0);
 	}
 	limitFF();
