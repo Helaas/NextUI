@@ -30,6 +30,7 @@
 #include "config.h"
 #include "ra_integration.h"
 #include "ra_badges.h"
+#include "hw_video.h"
 #include <dirent.h>
 #include <SDL2/SDL_image.h>
 #include <SDL2/SDL.h>
@@ -108,6 +109,24 @@ static int DEVICE_PITCH = 0;
 static int shader_reset_suppressed = 0;
 
 GFX_Renderer renderer;
+static MinarchHWVideo hw_video = {0};
+
+static uintptr_t hw_render_get_current_framebuffer(void)
+{
+	return PLAT_coreVideoFramebuffer();
+}
+
+static retro_proc_address_t hw_render_get_proc_address(const char *name)
+{
+	return (retro_proc_address_t)PLAT_coreVideoProcAddress(name);
+}
+
+static bool HWVideo_ensure_target(unsigned width, unsigned height)
+{
+	unsigned target_w = width ? width : 640;
+	unsigned target_h = height ? height : 480;
+	return PLAT_coreVideoEnsureTarget(target_w, target_h, hw_video.callback.depth, hw_video.callback.stencil);
+}
 
 ///////////////////////////////////////
 
@@ -4862,24 +4881,44 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
 	// 	puts("RETRO_ENVIRONMENT_GET_FASTFORWARDING"); fflush(stdout);
 	// 	break;
 	// };
-	case RETRO_ENVIRONMENT_SET_HW_RENDER:
-	{
-		struct retro_hw_render_callback *cb = (struct retro_hw_render_callback*)data;
-		
-		// Log the requested context
-		LOG_info("Core requested GL context type: %d, version %d.%d\n", 
-			cb->context_type, cb->version_major, cb->version_minor);
+	case RETRO_ENVIRONMENT_SET_HW_RENDER: {
+		const struct retro_hw_render_callback *request = (const struct retro_hw_render_callback *)data;
+		struct retro_hw_render_callback prepared;
 
-		// Fallback if version is 0.0 or other unexpected values
-		if (cb->context_type == 4 && cb->version_major == 0 && cb->version_minor == 0) {
-			LOG_info("Core requested invalid GL context type or version, defaulting to GLES 2.0\n");
-			cb->context_type = RETRO_HW_CONTEXT_OPENGLES3;
-			cb->version_major = 3;
-			cb->version_minor = 0;
+		if (!request) {
+			return false;
+		}
+
+		prepared = *request;
+		prepared.get_current_framebuffer = hw_render_get_current_framebuffer;
+		prepared.get_proc_address = hw_render_get_proc_address;
+
+		if (prepared.context_type == RETRO_HW_CONTEXT_OPENGLES3 &&
+			prepared.version_major == 0 &&
+			prepared.version_minor == 0) {
+			prepared.version_major = 3;
+			prepared.version_minor = 0;
+		}
+
+		if (!MinarchHWVideo_accept_request(&hw_video, &prepared)) {
+			LOG_error("Unsupported HW render context type %d\n", request->context_type);
+			return false;
+		}
+
+		if (!HWVideo_ensure_target(renderer.true_w, renderer.true_h)) {
+			LOG_error("Failed to allocate frontend HW render target\n");
+			MinarchHWVideo_reset(&hw_video);
+			return false;
+		}
+
+		if (hw_video.callback.context_reset) {
+			hw_video.callback.context_reset();
 		}
 
 		return true;
 	}
+	case RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE:
+		return false;
 	default:
 		// LOG_debug("Unsupported environment cmd: %u\n", cmd);
 		return false;
@@ -6113,6 +6152,15 @@ int Core_updateAVInfo(void) {
 	core.sample_rate = av_info.timing.sample_rate;
 	core.aspect_ratio = a;
 
+	if (hw_video.enabled) {
+		unsigned target_w = av_info.geometry.base_width ? av_info.geometry.base_width : av_info.geometry.max_width;
+		unsigned target_h = av_info.geometry.base_height ? av_info.geometry.base_height : av_info.geometry.max_height;
+		if (!HWVideo_ensure_target(target_w, target_h)) {
+			LOG_error("Failed to resize frontend HW render target to %ux%u\n", target_w, target_h);
+			quit = 1;
+		}
+	}
+
 	if (changed) LOG_info("aspect_ratio: %f (%ix%i) fps: %f\n", a, av_info.geometry.base_width,av_info.geometry.base_height, core.fps);
 
 	return changed;
@@ -6151,6 +6199,11 @@ void Core_quit(void) {
 		SRAM_write();
 		Cheats_free();
 		RTC_write();
+		if (hw_video.enabled && hw_video.callback.context_destroy) {
+			hw_video.callback.context_destroy();
+		}
+		PLAT_coreVideoDestroy();
+		MinarchHWVideo_reset(&hw_video);
 		core.unload_game();
 		core.deinit();
 		core.initialized = 0;
