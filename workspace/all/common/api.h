@@ -1,10 +1,44 @@
 #ifndef __API_H__
 #define __API_H__
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdint.h>
+
+#if defined(__has_include)
+#if __has_include(<SDL2/SDL.h>) || __has_include(<SDL/SDL.h>)
 #include "sdl.h"
+#else
+#define SDL_HEADERS_H
+typedef struct SDL_Surface SDL_Surface;
+typedef struct SDL_mutex SDL_mutex;
+typedef struct SDL_Event SDL_Event;
+typedef struct _TTF_Font TTF_Font;
+typedef struct SDL_Color {
+	uint8_t r;
+	uint8_t g;
+	uint8_t b;
+	uint8_t a;
+} SDL_Color;
+typedef struct SDL_Rect {
+	int x;
+	int y;
+	int w;
+	int h;
+} SDL_Rect;
+typedef int GLint;
+#endif
+#else
+#include "sdl.h"
+#endif
+
 #include "platform.h"
 #include "scaler.h"
 #include "config.h"
-#include <stdbool.h>
+
+#ifndef BTN_ID_COUNT
+#define BTN_ID_COUNT 26
+#endif
 
 ///////////////////////////////
 
@@ -190,10 +224,18 @@ enum {
 	EFFECT_COUNT,
 };
 
+typedef enum {
+	GFX_SOURCE_PIXELS = 0,
+	GFX_SOURCE_HW_TEXTURE = 1,
+} GFX_SourceType;
+
 typedef struct GFX_Renderer {
 	void* src;
 	void* dst;
 	void* blit;
+	GFX_SourceType source_type;
+	unsigned int src_texture;
+	int src_texture_flipped;
 	double aspect; // 0 for integer, -1 for fullscreen, otherwise aspect ratio, used for SDL2 accelerated scaling
 	int scale;
 	
@@ -214,6 +256,12 @@ typedef struct GFX_Renderer {
 	int dst_h;
 	int dst_p;
 } GFX_Renderer;
+
+bool PLAT_coreVideoEnsureTarget(unsigned width, unsigned height, bool depth, bool stencil);
+void PLAT_coreVideoDestroy(void);
+uintptr_t PLAT_coreVideoFramebuffer(void);
+void* PLAT_coreVideoProcAddress(const char *name);
+unsigned int PLAT_coreVideoTexture(void);
 
 typedef struct
 {
