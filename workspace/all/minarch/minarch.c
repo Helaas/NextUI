@@ -1987,6 +1987,9 @@ static void Rewind_sync_encode_state(void) {
 }
 
 static void Rewind_on_state_change(void) {
+	if (hw_video.enabled) {
+		MinarchHWVideo_invalidate_frame(&hw_video);
+	}
 	Rewind_reset();
 	Rewind_push(1);
 	LOG_info("Rewind: state changed, buffer re-seeded\n");
@@ -5760,56 +5763,46 @@ static void drawDebugHud(const void* data, unsigned width, unsigned height, size
 	}
 }
 
-static void video_refresh_callback_main(const void *data, unsigned width, unsigned height, size_t pitch) {
-	// return;
+static void present_frame(const void *rgba_frame, unsigned width, unsigned height, size_t pitch, bool is_hw_frame)
+{
+	static uint32_t last_flip_time = 0;
+	static int frame_counter = 0;
+	const int max_frames = 8;
 
 	Special_render();
-	
-	static uint32_t last_flip_time = 0;
-	
-	// 10 seems to be the sweet spot that allows 2x in NES and SNES and 8x in GB at 60fps
-	// 14 will let GB hit 10x but NES and SNES will drop to 1.5x at 30fps (not sure why)
-	// but 10 hurts PS...
-	// TODO: 10 was based on rg35xx, probably different results on other supported platforms
-	if (fast_forward && SDL_GetTicks()-last_flip_time<10) return;
-	
-	// FFVII menus 
-	// 16: 30/200
-	// 15: 30/180
-	// 14: 45/180
-	// 12: 30/150
-	// 10: 30/120 (optimize text off has no effect)
-	//  8: 60/210 (with optimize text off)
-	// eg. PS@10 60/240
-	if (!data) {
+
+	if (fast_forward && SDL_GetTicks() - last_flip_time < 10) {
 		return;
 	}
 
-	// if source has changed size (or forced by dst_p==0)
-	// eg. true src + cropped src + fixed dst + cropped dst
-	if (renderer.dst_p==0 || width!=renderer.true_w || height!=renderer.true_h) {
-		selectScaler(width, height, pitch);
+	if (renderer.dst_p == 0 || width != renderer.true_w || height != renderer.true_h) {
+		selectScaler(width, height, width * (int)sizeof(uint32_t));
 		GFX_clearAll();
 		if (!shader_reset_suppressed) {
 			GFX_resetShaders();
 		} else {
-			shader_reset_suppressed = 0; // consume suppression after one use
+			shader_reset_suppressed = 0;
 		}
 	}
-	
-	// debug
-	drawDebugHud(data, width, height, pitch, fmt);
-	
-	static int frame_counter = 0;
-	const int max_frames = 8; 
-	if(frame_counter<9) {
-		applyFadeIn((uint32_t **) &data, pitch, width, height, &frame_counter, max_frames);
+
+	if (!is_hw_frame) {
+		drawDebugHud(rgba_frame, width, height, pitch, fmt);
+		if (frame_counter < 9) {
+			applyFadeIn((uint32_t **)&rgba_frame, pitch, width, height, &frame_counter, max_frames);
+		}
+		renderer.source_type = GFX_SOURCE_PIXELS;
+		renderer.src = (void *)rgba_frame;
+		renderer.src_texture = 0;
+		renderer.src_texture_flipped = 0;
+	} else {
+		renderer.source_type = GFX_SOURCE_HW_TEXTURE;
+		renderer.src = NULL;
+		renderer.src_texture = PLAT_coreVideoTexture();
+		renderer.src_texture_flipped = hw_video.callback.bottom_left_origin ? 1 : 0;
 	}
 
-	renderer.src = (void*)data;
 	renderer.dst = screen->pixels;
 	GFX_blitRenderer(&renderer);
-
 	screen_flip(screen);
 	last_flip_time = SDL_GetTicks();
 }
@@ -5961,6 +5954,24 @@ static void convert_rgb565_to_rgba(const void* src, uint32_t* dst, unsigned widt
 }
 
 static void video_refresh_callback(const void* data, unsigned width, unsigned height, size_t pitch) {
+	if (quit) {
+		return;
+	}
+
+	if (hw_video.enabled && (data == RETRO_HW_FRAME_BUFFER_VALID || data == NULL)) {
+		if (data == RETRO_HW_FRAME_BUFFER_VALID) {
+			MinarchHWVideo_record_frame(&hw_video, width, height);
+		} else if (!hw_video.frame_ready) {
+			return;
+		} else {
+			width = hw_video.width;
+			height = hw_video.height;
+		}
+
+		present_frame(NULL, width, height, width * sizeof(uint32_t), true);
+		return;
+	}
+
 	// Log NEON availability once on first call
 	static int neon_logged = 0;
 	if (!neon_logged) {
@@ -5971,9 +5982,6 @@ static void video_refresh_callback(const void* data, unsigned width, unsigned he
 		LOG_info("Pixel conversion: Using scalar optimizations (NEON not available)\n");
 #endif
 	}
-
-	// Early exit if quitting to avoid rendering stale frames
-	if (quit) return;
 
 	// Allocate RGBA buffer if needed
 	if (!rgbaData || rgbaDataSize != width * height) {
@@ -6010,7 +6018,7 @@ static void video_refresh_callback(const void* data, unsigned width, unsigned he
 
 
 	// Render the frame
-	video_refresh_callback_main(data, width, height, pitch);
+	present_frame(data, width, height, pitch, false);
 }
 ///////////////////////////////
 
@@ -6185,6 +6193,9 @@ void Core_load(void) {
 	Core_updateAVInfo();
 }
 void Core_reset(void) {
+	if (hw_video.enabled) {
+		MinarchHWVideo_invalidate_frame(&hw_video);
+	}
 	core.reset();
 	Rewind_on_state_change();
 }
