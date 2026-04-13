@@ -9,6 +9,8 @@ void MinarchHWVideo_reset(MinarchHWVideo *video)
 
 bool MinarchHWVideo_accept_request(MinarchHWVideo *video, const struct retro_hw_render_callback *request)
 {
+    MinarchHWVideo_reset(video);
+
     if (!request) {
         return false;
     }

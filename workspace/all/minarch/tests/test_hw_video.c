@@ -70,10 +70,42 @@ static void test_frame_record_and_invalidation(void)
     assert(video.height == 480);
 }
 
+static void test_rejected_request_clears_previous_state(void)
+{
+    MinarchHWVideo video;
+    MinarchHWVideo_reset(&video);
+
+    struct retro_hw_render_callback accepted = {0};
+    accepted.context_type = RETRO_HW_CONTEXT_OPENGLES2;
+    accepted.version_major = 2;
+    accepted.version_minor = 0;
+
+    assert(MinarchHWVideo_accept_request(&video, &accepted));
+    MinarchHWVideo_record_frame(&video, 320, 240);
+    assert(video.enabled);
+    assert(video.frame_ready);
+    assert(video.context_type == RETRO_HW_CONTEXT_OPENGLES2);
+
+    struct retro_hw_render_callback rejected = {0};
+    rejected.context_type = RETRO_HW_CONTEXT_VULKAN;
+    rejected.version_major = 1;
+    rejected.version_minor = 0;
+
+    assert(!MinarchHWVideo_accept_request(&video, &rejected));
+    assert(!video.enabled);
+    assert(!video.frame_ready);
+    assert(video.context_type == 0);
+    assert(video.version_major == 0);
+    assert(video.version_minor == 0);
+    assert(video.width == 0);
+    assert(video.height == 0);
+}
+
 int main(void)
 {
     test_rejects_non_gles_context();
     test_accepts_gles3_request_and_copies_callback();
     test_frame_record_and_invalidation();
+    test_rejected_request_clears_previous_state();
     return 0;
 }
