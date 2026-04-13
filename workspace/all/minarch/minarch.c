@@ -118,6 +118,9 @@ static GLuint hw_fbo_depth = 0;
 static int hw_fbo_width = 0;
 static int hw_fbo_height = 0;
 static int hw_render_uses_screen = 0; // Set when core renders to FB 0 instead of the provided FBO
+static int pending_rewind_reseed = 0;
+static unsigned int pending_rewind_reseed_hw_frame = 0;
+static int post_load_hw_frame_logs_remaining = 0;
 
 ///////////////////////////////////////
 
@@ -987,6 +990,34 @@ static void State_getPath(char* filename) {
 }
 
 #define RASTATE_HEADER_SIZE 16
+
+typedef enum {
+	STATE_LOAD_REASON_NONE = 0,
+	STATE_LOAD_REASON_RESUME,
+	STATE_LOAD_REASON_MENU,
+} StateLoadReason;
+
+static struct {
+	int active;
+	int slot;
+	int notify;
+	int attempts_left;
+	unsigned int ready_hw_frame;
+	StateLoadReason reason;
+} pending_state_load = {0};
+
+static struct {
+	int active;
+	int slot;
+	int notify;
+	int attempts_left;
+	unsigned int ready_hw_frame;
+} pending_state_save = {0};
+
+static int hw_frame_seen = 0;
+static unsigned int hw_frame_count = 0;
+static int pending_quit_after_save = 0;
+
 static int State_read(void) { // from picoarch
 	// Block load states in RetroAchievements hardcore mode
 	if (RA_isHardcoreModeActive()) {
@@ -1167,22 +1198,264 @@ error:
 	return success;
 }
 
+static void Rewind_on_state_change(void);
+static void hw_fbo_ensure(int width, int height);
+static void hw_fbo_destroy(void);
+
+static void State_scheduleRewindReseed(void) {
+	if (!hw_render_enabled) {
+		pending_rewind_reseed = 0;
+		pending_rewind_reseed_hw_frame = 0;
+		Rewind_on_state_change();
+		return;
+	}
+
+	pending_rewind_reseed = 1;
+	pending_rewind_reseed_hw_frame = hw_frame_count + 4;
+	LOG_info("Deferred rewind reseed until hw_frame=%u after HW state load\n",
+		pending_rewind_reseed_hw_frame);
+}
+
+static void State_pushLoadNotification(int success, int slot) {
+	if (!CFG_getNotifyLoad()) return;
+
+	char msg[NOTIFICATION_MAX_MESSAGE];
+	// User-facing slots are 1-8 (internal 0-7)
+	snprintf(msg, sizeof(msg), success ? "State Loaded - Slot %d" : "Load Failed - Slot %d", slot + 1);
+	Notification_push(NOTIFICATION_LOAD_STATE, msg, NULL);
+}
+
+static void State_pushSaveNotification(int success, int slot) {
+	if (!CFG_getNotifyManualSave()) return;
+
+	char msg[NOTIFICATION_MAX_MESSAGE];
+	// User-facing slots are 1-8 (internal 0-7)
+	snprintf(msg, sizeof(msg), success ? "State Saved - Slot %d" : "Save Failed - Slot %d", slot + 1);
+	Notification_push(NOTIFICATION_SAVE_STATE, msg, NULL);
+}
+
+static void State_refreshHWContextAfterLoad(void) {
+	int reset_width;
+	int reset_height;
+
+	if (!hw_render_enabled || !hw_render_cb || !hw_render_cb->context_reset) return;
+
+	reset_width = hw_fbo_width > 0 ? hw_fbo_width : 640;
+	reset_height = hw_fbo_height > 0 ? hw_fbo_height : 480;
+
+	PLAT_GL_BindSharedContext(1);
+	hw_fbo_ensure(reset_width, reset_height);
+	hw_render_cb->context_reset();
+	glFinish();
+	PLAT_GL_BindSharedContext(0);
+
+	LOG_info("HW-render: context_reset called after state load (%dx%d fbo=%u tex=%u)\n",
+		reset_width, reset_height, hw_fbo, hw_fbo_texture);
+}
+
+static void State_queueLoad(int slot, StateLoadReason reason, int notify) {
+	unsigned int hw_frame_delay = 0;
+
+	if (hw_render_enabled) {
+		if (reason == STATE_LOAD_REASON_RESUME) hw_frame_delay = 30;
+		else if (reason == STATE_LOAD_REASON_MENU) hw_frame_delay = 2;
+	}
+
+	pending_rewind_reseed = 0;
+	pending_rewind_reseed_hw_frame = 0;
+	post_load_hw_frame_logs_remaining = 0;
+	hw_debug_mainctx_samples_remaining = 0;
+	hw_render_src_texture = 0;
+	hw_render_postload_track_source = 0;
+
+	pending_state_load.active = 1;
+	pending_state_load.slot = slot;
+	pending_state_load.notify = notify;
+	pending_state_load.reason = reason;
+	pending_state_load.attempts_left = hw_render_enabled ? 8 : 1;
+	pending_state_load.ready_hw_frame = hw_frame_count + hw_frame_delay;
+
+	LOG_info("Queued state load for slot %d (reason=%d notify=%d attempts=%d ready_hw_frame=%u current_hw_frame=%u)\n",
+		slot, reason, notify, pending_state_load.attempts_left,
+		pending_state_load.ready_hw_frame, hw_frame_count);
+}
+
+static void State_queueSave(int slot, int notify) {
+	unsigned int hw_frame_delay = 0;
+
+	if (hw_render_enabled) {
+		hw_frame_delay = 2;
+	}
+
+	pending_state_save.active = 1;
+	pending_state_save.slot = slot;
+	pending_state_save.notify = notify;
+	pending_state_save.attempts_left = hw_render_enabled ? 8 : 1;
+	pending_state_save.ready_hw_frame = hw_frame_count + hw_frame_delay;
+
+	LOG_info("Queued state save for slot %d (notify=%d attempts=%d ready_hw_frame=%u current_hw_frame=%u)\n",
+		slot, notify, pending_state_save.attempts_left,
+		pending_state_save.ready_hw_frame, hw_frame_count);
+}
+
+static int State_loadSlot(int slot) {
+	int last_state_slot = state_slot;
+	int success;
+	char filename[MAX_PATH];
+
+	state_slot = slot;
+	State_getPath(filename);
+	LOG_info("Attempting state load for slot %d from %s\n", slot, filename);
+	success = State_read();
+	state_slot = last_state_slot;
+
+	if (!success) return 0;
+
+	if (hw_render_enabled) {
+		State_refreshHWContextAfterLoad();
+		renderer.dst_p = 0;
+		GFX_resetShaders();
+		shader_reset_suppressed = 0;
+		post_load_hw_frame_logs_remaining = 6;
+		hw_debug_mainctx_samples_remaining = 6;
+		hw_render_src_texture = 0;
+		hw_render_postload_track_source = 1;
+		State_scheduleRewindReseed();
+		return 1;
+	}
+
+	State_scheduleRewindReseed();
+	return 1;
+}
+
+static int State_saveSlot(int slot) {
+	int last_state_slot = state_slot;
+	int success;
+	char filename[MAX_PATH];
+
+	state_slot = slot;
+	State_getPath(filename);
+	LOG_info("Attempting state save for slot %d to %s\n", slot, filename);
+	success = State_write();
+	state_slot = last_state_slot;
+
+	if (success) {
+		LOG_info("State save succeeded for slot %d\n", slot);
+	} else {
+		LOG_warn("State save failed for slot %d\n", slot);
+	}
+
+	return success;
+}
+
+static int State_processPending(void) {
+	int success;
+
+	if (!pending_state_load.active) return 0;
+	if (hw_render_enabled && !hw_frame_seen) return 0;
+	if (hw_render_enabled && hw_frame_count < pending_state_load.ready_hw_frame) return 0;
+
+	LOG_info("Processing queued state load for slot %d at hw_frame=%u (reason=%d)\n",
+		pending_state_load.slot, hw_frame_count, pending_state_load.reason);
+	success = State_loadSlot(pending_state_load.slot);
+	if (success) {
+		LOG_info("Queued state load succeeded for slot %d at hw_frame=%u\n",
+			pending_state_load.slot, hw_frame_count);
+		if (pending_state_load.reason == STATE_LOAD_REASON_RESUME) {
+			unlink(RESUME_SLOT_PATH);
+		}
+		if (pending_state_load.notify) {
+			State_pushLoadNotification(1, pending_state_load.slot);
+		}
+		pending_state_load.active = 0;
+		return 1;
+	}
+
+	pending_state_load.attempts_left -= 1;
+	if (pending_state_load.attempts_left > 0) {
+		LOG_warn("Queued state load failed for slot %d at hw_frame=%u (%d attempts left)\n",
+			pending_state_load.slot, hw_frame_count, pending_state_load.attempts_left);
+		if (hw_render_enabled) {
+			pending_state_load.ready_hw_frame = hw_frame_count + 15;
+		}
+		return 1;
+	}
+
+	LOG_error("Queued state load exhausted retries for slot %d at hw_frame=%u\n",
+		pending_state_load.slot, hw_frame_count);
+	if (pending_state_load.notify) {
+		State_pushLoadNotification(0, pending_state_load.slot);
+	}
+	pending_state_load.active = 0;
+	return 1;
+}
+
+static int State_processPendingSave(void) {
+	int success;
+
+	if (!pending_state_save.active) return 0;
+	if (hw_render_enabled && !hw_frame_seen) return 0;
+	if (hw_render_enabled && hw_frame_count < pending_state_save.ready_hw_frame) return 0;
+
+	LOG_info("Processing queued state save for slot %d at hw_frame=%u\n",
+		pending_state_save.slot, hw_frame_count);
+	success = State_saveSlot(pending_state_save.slot);
+	if (success) {
+		if (pending_state_save.notify) {
+			State_pushSaveNotification(1, pending_state_save.slot);
+		}
+		pending_state_save.active = 0;
+		if (pending_quit_after_save) {
+			pending_quit_after_save = 0;
+			quit = 1;
+		}
+		return 1;
+	}
+
+	pending_state_save.attempts_left -= 1;
+	if (pending_state_save.attempts_left > 0) {
+		LOG_warn("Queued state save failed for slot %d at hw_frame=%u (%d attempts left)\n",
+			pending_state_save.slot, hw_frame_count, pending_state_save.attempts_left);
+		if (hw_render_enabled) {
+			pending_state_save.ready_hw_frame = hw_frame_count + 15;
+		}
+		return 1;
+	}
+
+	LOG_error("Queued state save exhausted retries for slot %d at hw_frame=%u\n",
+		pending_state_save.slot, hw_frame_count);
+	if (pending_state_save.notify) {
+		State_pushSaveNotification(0, pending_state_save.slot);
+	}
+	pending_state_save.active = 0;
+	if (pending_quit_after_save) {
+		pending_quit_after_save = 0;
+		quit = 1;
+	}
+	return 1;
+}
+
 static void State_autosave(void) {
 	int last_state_slot = state_slot;
 	state_slot = AUTO_RESUME_SLOT;
 	State_write();
 	state_slot = last_state_slot;
 }
-static void Rewind_on_state_change(void);
 static void State_resume(void) {
+	int resume_slot;
+
 	if (!exists(RESUME_SLOT_PATH)) return;
-	
-	int last_state_slot = state_slot;
-	state_slot = getInt(RESUME_SLOT_PATH);
-	unlink(RESUME_SLOT_PATH);
-	State_read();
-	state_slot = last_state_slot;
-	Rewind_on_state_change();
+
+	resume_slot = getInt(RESUME_SLOT_PATH);
+
+	if (hw_render_enabled) {
+		State_queueLoad(resume_slot, STATE_LOAD_REASON_RESUME, 0);
+		return;
+	}
+
+	if (State_loadSlot(resume_slot)) {
+		unlink(RESUME_SLOT_PATH);
+	}
 }
 
 ///////////////////////////////
@@ -4191,7 +4464,13 @@ static int setFastForward(int enable) {
 
 static uint32_t buttons = 0; // RETRO_DEVICE_ID_JOYPAD_* buttons
 static int ignore_menu = 0;
-static void input_poll_callback(void) {
+static unsigned int input_poll_token = 1;
+static unsigned int input_poll_done_token = 0;
+
+static void input_poll_frontend_state(void) {
+	if (input_poll_done_token == input_poll_token) return;
+	input_poll_done_token = input_poll_token;
+
 	PAD_poll();
 
 	int show_setting = 0;
@@ -4386,6 +4665,9 @@ static void input_poll_callback(void) {
 	}
 	
 	// if (buttons) LOG_info("buttons: %i\n", buttons);
+}
+static void input_poll_callback(void) {
+	input_poll_frontend_state();
 }
 static int16_t input_state_callback(unsigned port, unsigned device, unsigned index, unsigned id) {
 	if (port==0 && device==RETRO_DEVICE_JOYPAD && index==0) {
@@ -4827,7 +5109,7 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
 			const struct retro_controller_info *info = &infos[0];
 			for (int i=0; i<info->num_types; i++) {
 				const struct retro_controller_description *type = &info->types[i];
-				if (exactMatch((char*)type->desc,"dualshock")) { // currently only enabled for PlayStation
+				if (containsString((char*)type->desc, "dualshock")) { // currently only enabled for PlayStation
 					has_custom_controllers = 1;
 					break;
 				}
@@ -6173,6 +6455,45 @@ static void video_refresh_callback(const void* data, unsigned width, unsigned he
 	// HW-rendered frame (e.g. GL core): data == RETRO_HW_FRAME_BUFFER_VALID = (void*)-1.
 	// There is no CPU-accessible pixel buffer to convert — pass straight through.
 	if (hw_render_enabled && data == RETRO_HW_FRAME_BUFFER_VALID) {
+		GLint current_fbo = 0;
+		GLint attachment_type = GL_NONE;
+		GLint attachment_name = 0;
+
+		hw_frame_seen = 1;
+		hw_frame_count += 1;
+		glGetIntegerv(GL_FRAMEBUFFER_BINDING, &current_fbo);
+		if (hw_render_postload_track_source) {
+			if ((GLuint)current_fbo == hw_fbo) {
+				hw_render_src_texture = 0;
+				hw_render_postload_track_source = 0;
+			} else if (current_fbo > 0) {
+				hw_render_src_texture = 0;
+				glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER,
+					GL_COLOR_ATTACHMENT0,
+					GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+					&attachment_type);
+				if (attachment_type == GL_TEXTURE) {
+					glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER,
+						GL_COLOR_ATTACHMENT0,
+						GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+						&attachment_name);
+					if (attachment_name > 0) {
+						hw_render_src_texture = (GLuint)attachment_name;
+					}
+				}
+			} else {
+				hw_render_src_texture = 0;
+			}
+		}
+		if (post_load_hw_frame_logs_remaining > 0) {
+			int post_load_frame_index = 7 - post_load_hw_frame_logs_remaining;
+			LOG_info("HW-render: post-load frame %d at hw_frame=%u (%ux%u bound_fbo=%d expected_fbo=%u tex=%u src_tex=%u attachment_type=0x%x)\n",
+				post_load_frame_index, hw_frame_count, width, height,
+				current_fbo, hw_fbo, hw_fbo_texture, hw_render_src_texture,
+				(unsigned int)attachment_type);
+			post_load_hw_frame_logs_remaining -= 1;
+		}
+
 		// Ensure FBO matches the core's current output size
 		hw_fbo_ensure(width, height);
 
@@ -6312,7 +6633,12 @@ void Core_open(const char* core_path, const char* tag_name) {
 	sprintf((char*)core.config_dir, USERDATA_PATH "/%s-%s", core.tag, core.name);
 	sprintf((char*)core.states_dir, SHARED_USERDATA_PATH "/%s-%s", core.tag, core.name);
 	sprintf((char*)core.saves_dir, SDCARD_PATH "/Saves/%s", core.tag);
-	sprintf((char*)core.bios_dir, SDCARD_PATH "/Bios/%s", core.tag);
+	if (exactMatch((char*)core.tag, "PSX")) {
+		sprintf((char*)core.bios_dir, SDCARD_PATH "/Bios/PS");
+	}
+	else {
+		sprintf((char*)core.bios_dir, SDCARD_PATH "/Bios/%s", core.tag);
+	}
 	sprintf((char*)core.cheats_dir, SDCARD_PATH "/Cheats/%s", core.tag);
 	sprintf((char*)core.overlays_dir, SDCARD_PATH "/Overlays/%s", core.tag);
 	
@@ -8652,6 +8978,8 @@ static void Menu_screenshot(void) {
 }
 static void Menu_saveState(void) {
 	// LOG_info("Menu_saveState\n");
+	int success;
+
 	Menu_updateState();
 	
 	if (menu.total_discs) {
@@ -8677,48 +9005,53 @@ static void Menu_saveState(void) {
 		LOG_info("saved screenshot\n");
 	}
 	
-	state_slot = menu.slot;
 	putInt(menu.slot_path, menu.slot);
-	int success = State_write();
-	
-	// Show notification if enabled
+
+	if (hw_render_enabled) {
+		if (quit) {
+			pending_quit_after_save = 1;
+			quit = 0;
+		}
+		State_queueSave(menu.slot, CFG_getNotifyManualSave());
+		return;
+	}
+
+	success = State_saveSlot(menu.slot);
 	if (CFG_getNotifyManualSave()) {
-		char msg[NOTIFICATION_MAX_MESSAGE];
-		// User-facing slots are 1-8 (internal 0-7)
-		snprintf(msg, sizeof(msg), success ? "State Saved - Slot %d" : "Save Failed - Slot %d", menu.slot + 1);
-		Notification_push(NOTIFICATION_SAVE_STATE, msg, NULL);
+		State_pushSaveNotification(success, menu.slot);
 	}
 }
 static void Menu_loadState(void) {
+	int success;
+
 	Menu_updateState();
 
-	if (menu.save_exists) {
-		if (menu.total_discs) {
-			char slot_disc_name[256];
-			getFile(menu.txt_path, slot_disc_name, 256);
+	if (!menu.save_exists) return;
 
-			char slot_disc_path[256];
-			if (slot_disc_name[0]=='/') strcpy(slot_disc_path, slot_disc_name);
-			else sprintf(slot_disc_path, "%s%s", menu.base_path, slot_disc_name);
+	if (menu.total_discs) {
+		char slot_disc_name[256];
+		getFile(menu.txt_path, slot_disc_name, 256);
 
-			char* disc_path = menu.disc_paths[menu.disc];
-			if (!exactMatch(slot_disc_path, disc_path)) {
-				Game_changeDisc(slot_disc_path);
-			}
+		char slot_disc_path[256];
+		if (slot_disc_name[0]=='/') strcpy(slot_disc_path, slot_disc_name);
+		else sprintf(slot_disc_path, "%s%s", menu.base_path, slot_disc_name);
+
+		char* disc_path = menu.disc_paths[menu.disc];
+		if (!exactMatch(slot_disc_path, disc_path)) {
+			Game_changeDisc(slot_disc_path);
 		}
+	}
 
-		state_slot = menu.slot;
-		putInt(menu.slot_path, menu.slot);
-		int success = State_read();
-		Rewind_on_state_change();
-		
-		// Show notification if enabled
-		if (CFG_getNotifyLoad()) {
-			char msg[NOTIFICATION_MAX_MESSAGE];
-			// User-facing slots are 1-8 (internal 0-7)
-			snprintf(msg, sizeof(msg), success ? "State Loaded - Slot %d" : "Load Failed - Slot %d", menu.slot + 1);
-			Notification_push(NOTIFICATION_LOAD_STATE, msg, NULL);
-		}
+	putInt(menu.slot_path, menu.slot);
+
+	if (hw_render_enabled) {
+		State_queueLoad(menu.slot, STATE_LOAD_REASON_MENU, CFG_getNotifyLoad());
+		return;
+	}
+
+	success = State_loadSlot(menu.slot);
+	if (CFG_getNotifyLoad()) {
+		State_pushLoadNotification(success, menu.slot);
 	}
 }
 
@@ -9034,6 +9367,7 @@ static void Menu_loop(void) {
 					if (i==menu.slot)GFX_blitAsset(ASSET_PAGE, NULL, screen, &(SDL_Rect){ox+SCALE1(i*15),oy});
 					else GFX_blitAsset(ASSET_DOT, NULL, screen, &(SDL_Rect){ox+SCALE1(i*15)+4,oy+SCALE1(2)});
 				}
+				
 			}
 			GFX_flip(screen);
 			dirty=0;
@@ -9131,6 +9465,20 @@ static void core_run_with_hw_context(void) {
 }
 
 static void run_frame(void) {
+	int processed_pending = 0;
+	int suppress_rewind_capture = pending_rewind_reseed && hw_render_enabled;
+
+	input_poll_token += 1;
+	if (input_poll_token == 0) {
+		input_poll_token = 1;
+		input_poll_done_token = 0;
+	}
+	input_poll_frontend_state();
+
+	if (!hw_render_enabled && pending_state_load.active) {
+		processed_pending = State_processPending();
+	}
+
 	// if rewind is toggled, fast-forward toggle must stay off; fast-forward hold pauses rewind
 	int do_rewind = (rewind_pressed || rewind_toggle) && !(rewind_toggle && ff_hold_active);
 	if (do_rewind) {
@@ -9164,28 +9512,53 @@ static void run_frame(void) {
 					ff_paused_by_rewind_hold = 0;
 					fast_forward = setFastForward(1);
 				}
-				if (was_rewinding) {
-					rewinding = 1;
-					Rewind_sync_encode_state();
+					if (was_rewinding) {
+						rewinding = 1;
+						if (!suppress_rewind_capture) {
+							Rewind_sync_encode_state();
+						}
+					}
+					rewinding = 0;
+					core_run_with_hw_context();
+					if (!suppress_rewind_capture) {
+						Rewind_push(0);
+					}
 				}
-				rewinding = 0;
-				core_run_with_hw_context();
+			}
+		}
+		else {
+			if (!suppress_rewind_capture) {
+				Rewind_sync_encode_state();
+			}
+			rewinding = 0;
+			if (ff_paused_by_rewind_hold && !rewind_pressed) {
+				// resume fast forward after hold rewind ends
+			if (ff_toggled) fast_forward = setFastForward(1);
+			ff_paused_by_rewind_hold = 0;
+			}
+
+			core_run_with_hw_context();
+			if (!suppress_rewind_capture) {
 				Rewind_push(0);
 			}
 		}
-	}
-	else {
-		Rewind_sync_encode_state();
-		rewinding = 0;
-		if (ff_paused_by_rewind_hold && !rewind_pressed) {
-			// resume fast forward after hold rewind ends
-			if (ff_toggled) fast_forward = setFastForward(1);
-			ff_paused_by_rewind_hold = 0;
-		}
 
-		core_run_with_hw_context();
-		Rewind_push(0);
+	if (!processed_pending && pending_state_load.active) {
+		State_processPending();
 	}
+
+	if (pending_state_save.active) {
+		State_processPendingSave();
+	}
+
+	if (pending_rewind_reseed && hw_render_enabled && hw_frame_seen &&
+		hw_frame_count >= pending_rewind_reseed_hw_frame) {
+		LOG_info("Running deferred rewind reseed at hw_frame=%u\n", hw_frame_count);
+		pending_rewind_reseed = 0;
+		pending_rewind_reseed_hw_frame = 0;
+		Rewind_on_state_change();
+	}
+
 	limitFF();
 }
 
@@ -9299,6 +9672,18 @@ int main(int argc , char* argv[]) {
 	// ah, because it's defined before options_menu...
 	options_menu.items[1].desc = (char*)core.version;
 	Core_load();
+
+	pending_state_load.active = 0;
+	pending_state_save.active = 0;
+	pending_quit_after_save = 0;
+	hw_frame_seen = 0;
+	hw_frame_count = 0;
+	pending_rewind_reseed = 0;
+	pending_rewind_reseed_hw_frame = 0;
+	post_load_hw_frame_logs_remaining = 0;
+	hw_debug_mainctx_samples_remaining = 0;
+	hw_render_src_texture = 0;
+	hw_render_postload_track_source = 0;
 
 	// HW-render: create FBO and trigger the core's context_reset callback
 	if (hw_render_enabled && hw_render_cb) {
@@ -9479,10 +9864,21 @@ finish:
 		hw_fbo_destroy();
 		glFinish();
 		PLAT_GL_BindSharedContext(0);
-		hw_render_enabled = 0;
-		hw_render_uses_screen = 0;
-		hw_render_cb = NULL;
-	}
+			hw_render_enabled = 0;
+			hw_render_uses_screen = 0;
+			hw_frame_seen = 0;
+			hw_frame_count = 0;
+			pending_rewind_reseed = 0;
+			pending_rewind_reseed_hw_frame = 0;
+			post_load_hw_frame_logs_remaining = 0;
+			hw_debug_mainctx_samples_remaining = 0;
+			hw_render_src_texture = 0;
+			hw_render_postload_track_source = 0;
+			pending_state_load.active = 0;
+			pending_state_save.active = 0;
+			pending_quit_after_save = 0;
+			hw_render_cb = NULL;
+		}
 
 	Core_quit();
 	Core_close();

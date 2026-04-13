@@ -66,12 +66,12 @@ Roms
 
 Included in this zip is a "Roms" folder containing folders for each console NextUI currently supports. You can rename these folders but you must keep the uppercase tag name in parentheses in order to retain the mapping to the correct emulator (eg. "Nintendo Entertainment System (FC)" could be renamed to "Nintendo (FC)", "NES (FC)", or "Famicom (FC)"). 
 
-When one or more folder share the same display name (eg. "Game Boy Advance (GBA)" and "Game Boy Advance (MGBA)") they will be combined into a single menu item containing the roms from both folders (continuing the previous example, "Game Boy Advance"). This allows opening specific roms with an alternate pak.
+When one or more folder share the same display name (eg. "Game Boy Advance (GBA)" and "Game Boy Advance (MGBA)") they will be combined into a single menu item containing the roms from both folders (continuing the previous example, "Game Boy Advance"). This allows opening specific roms with an alternate pak. For example, the stock PlayStation pak can stay on PS while an alternate SwanStation pak uses PSX.
 
 ----------------------------------------
 Bios
 
-Some emulators require or perform much better with official bios. NextUI is strictly BYOB. Place the bios for each system in a folder that matches the tag in the corresponding "Roms" folder name (eg. bios for "Sony PlayStation (PS)" roms goes in "/Bios/PS/"), or refer to https://nextui.loveretro.games/usage/#required-bios for the correct file names and locations.
+Some emulators require or perform much better with official bios. NextUI is strictly BYOB. Place the bios for each system in a folder that matches the tag in the corresponding "Roms" folder name (eg. bios for "Sony PlayStation (PS)" roms goes in "/Bios/PS/"), or refer to https://nextui.loveretro.games/usage/#required-bios for the correct file names and locations. The alternate SwanStation pak uses the PSX tag but still reuses /Bios/PS/.
 
 Bios file names are case-sensitive:
 
@@ -83,6 +83,7 @@ Bios file names are case-sensitive:
        bios_CD_J.bin
        bios_CD_U.bin
    PS: psxonpsp660.bin
+  PSX: uses /Bios/PS/psxonpsp660.bin
 
 ----------------------------------------
 Cheats

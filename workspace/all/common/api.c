@@ -218,6 +218,9 @@ int should_rotate = 0;
 int hw_render_enabled = 0;
 GLuint hw_fbo_texture = 0;
 int hw_render_bottom_left_origin = 0;
+int hw_debug_mainctx_samples_remaining = 0;
+GLuint hw_render_src_texture = 0;
+int hw_render_postload_track_source = 0;
 
 FALLBACK_IMPLEMENTATION void PLAT_pinToCores(int core_type)
 {

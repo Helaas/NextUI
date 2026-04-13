@@ -81,6 +81,9 @@ extern SDL_Color ALT_BUTTON_TEXT_COLOR;
 extern int hw_render_enabled;
 extern GLuint hw_fbo_texture;
 extern int hw_render_bottom_left_origin;
+extern int hw_debug_mainctx_samples_remaining;
+extern GLuint hw_render_src_texture;
+extern int hw_render_postload_track_source;
 
 typedef struct {
 	float ratio;

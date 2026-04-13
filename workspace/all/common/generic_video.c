@@ -35,7 +35,6 @@ static int finalScaleFilter=GL_LINEAR;
 static int reloadShaderTextures = 1;
 static int shaderResetRequested = 0;
 static int externalGLStateDirty = 0;
-static int hw_mainctx_debug_logs = 0;
 
 static SDL_BlendMode getPremultipliedBlendMode(void) {
 	return SDL_ComposeCustomBlendMode(
@@ -161,7 +160,7 @@ void PLAT_GL_BindSharedContext(int enable) {
 static char* overlay_path = NULL;
 
 static void debug_hw_texture_in_main_context(GLuint texture, int width, int height) {
-	if (!texture || hw_mainctx_debug_logs >= 8 || width <= 0 || height <= 0) {
+	if (!texture || hw_debug_mainctx_samples_remaining <= 0 || width <= 0 || height <= 0) {
 		return;
 	}
 
@@ -182,10 +181,10 @@ static void debug_hw_texture_in_main_context(GLuint texture, int width, int heig
 	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)previous_fbo);
 	glDeleteFramebuffers(1, &debug_fbo);
 
-	LOG_info("HW-render mainctx %d: tex=%u is_texture=%d fbo_status=0x%x sample=%u,%u,%u,%u size=%dx%d\n",
-		hw_mainctx_debug_logs + 1, texture, is_texture ? 1 : 0, status,
+	LOG_info("HW-render mainctx sample %d: tex=%u is_texture=%d fbo_status=0x%x sample=%u,%u,%u,%u size=%dx%d\n",
+		hw_debug_mainctx_samples_remaining, texture, is_texture ? 1 : 0, status,
 		pixel[0], pixel[1], pixel[2], pixel[3], width, height);
-	hw_mainctx_debug_logs++;
+	hw_debug_mainctx_samples_remaining--;
 }
 
 // Notification overlay state for RA achievements
@@ -2137,15 +2136,20 @@ void PLAT_GL_Swap() {
 	GLuint effective_src_texture = 0;
 	GLuint final_shader = g_shader_default;
 
-	if (vid.blit->hw_frame && hw_fbo_texture) {
+	if (vid.blit->hw_frame && (hw_render_src_texture || hw_fbo_texture)) {
 		// HW-rendered frame: the core already drew into hw_fbo_texture.
 		// Use it directly as the source — skip CPU pixel upload entirely.
 		// FBO-backed libretro frames with bottom_left_origin already use GL-style
 		// texture orientation, so the default CPU-frame vertical flip shader is wrong.
-		effective_src_texture = hw_fbo_texture;
-		final_shader = hw_render_bottom_left_origin ? g_noshader : g_shader_default;
+		effective_src_texture = hw_render_src_texture ? hw_render_src_texture : hw_fbo_texture;
+		if (hw_render_src_texture) {
+			final_shader = g_shader_default;
+		} else {
+			final_shader = hw_render_bottom_left_origin ? g_noshader : g_shader_default;
+		}
 		src_w_last = vid.blit->src_w;
 		src_h_last = vid.blit->src_h;
+		debug_hw_texture_in_main_context(effective_src_texture, vid.blit->src_w, vid.blit->src_h);
 	} else {
 		if (!src_texture || reloadShaderTextures) {
 			if (src_texture==0)
