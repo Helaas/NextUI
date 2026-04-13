@@ -2034,6 +2034,10 @@ void PLAT_GL_Swap() {
     SDL_Rect dst_rect = {0, 0, device_width, device_height};
     setRectToAspectRatio(&dst_rect);
 
+    if (vid.blit->source_type == GFX_SOURCE_HW_TEXTURE && vid.blit->src_texture == 0) {
+        return;
+    }
+
     if (vid.blit->source_type != GFX_SOURCE_HW_TEXTURE && !vid.blit->src) {
         return;
     }
