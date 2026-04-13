@@ -4884,26 +4884,19 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
 	// 	puts("RETRO_ENVIRONMENT_GET_FASTFORWARDING"); fflush(stdout);
 	// 	break;
 	// };
-	case RETRO_ENVIRONMENT_SET_HW_RENDER: {
-		const struct retro_hw_render_callback *request = (const struct retro_hw_render_callback *)data;
-		struct retro_hw_render_callback prepared;
+	case RETRO_ENVIRONMENT_SET_HW_RENDER:
+	case RETRO_ENVIRONMENT_SET_HW_RENDER | RETRO_ENVIRONMENT_EXPERIMENTAL: {
+		struct retro_hw_render_callback *request = (struct retro_hw_render_callback *)data;
 
 		if (!request) {
 			return false;
 		}
 
-		prepared = *request;
-		prepared.get_current_framebuffer = hw_render_get_current_framebuffer;
-		prepared.get_proc_address = hw_render_get_proc_address;
-
-		if (prepared.context_type == RETRO_HW_CONTEXT_OPENGLES3 &&
-			prepared.version_major == 0 &&
-			prepared.version_minor == 0) {
-			prepared.version_major = 3;
-			prepared.version_minor = 0;
-		}
-
-		if (!MinarchHWVideo_accept_request(&hw_video, &prepared)) {
+		if (!MinarchHWVideo_prepare_request(
+			&hw_video,
+			request,
+			hw_render_get_current_framebuffer,
+			hw_render_get_proc_address)) {
 			LOG_error("Unsupported HW render context type %d\n", request->context_type);
 			return false;
 		}
@@ -4912,10 +4905,6 @@ static bool environment_callback(unsigned cmd, void *data) { // copied from pico
 			LOG_error("Failed to allocate frontend HW render target\n");
 			MinarchHWVideo_reset(&hw_video);
 			return false;
-		}
-
-		if (hw_video.callback.context_reset) {
-			hw_video.callback.context_reset();
 		}
 
 		return true;
@@ -6174,14 +6163,21 @@ int Core_updateAVInfo(void) {
 	return changed;
 }
 
-void Core_load(void) {
+bool Core_load(void) {
 	LOG_info("Core_load\n");
 	struct retro_game_info game_info;
 	game_info.path = game.tmp_path[0]?game.tmp_path:game.path;
 	game_info.data = game.data;
 	game_info.size = game.size;
 	LOG_info("game path: %s (%i)\n", game_info.path, game.size);
-	core.load_game(&game_info);
+	int load_ok = core.load_game(&game_info);
+	if (!load_ok) {
+		if (hw_video.enabled) {
+			MinarchHWVideo_clear_context_reset_pending(&hw_video);
+		}
+		LOG_error("Core failed to load game\n");
+		return false;
+	}
 
 	if (Cheats_load())
 		Core_applyCheats(&cheatcodes);
@@ -6191,6 +6187,13 @@ void Core_load(void) {
 	// NOTE: must be called after core.load_game!
 	core.set_controller_port_device(0, RETRO_DEVICE_JOYPAD); // set a default, may update after loading configs
 	Core_updateAVInfo();
+
+	if (hw_video.enabled &&
+		hw_video.callback.context_reset &&
+		MinarchHWVideo_take_context_reset_pending(&hw_video)) {
+		hw_video.callback.context_reset();
+	}
+	return true;
 }
 void Core_reset(void) {
 	if (hw_video.enabled) {
@@ -9102,7 +9105,7 @@ int main(int argc , char* argv[]) {
 	// why not move to Core_init()?
 	// ah, because it's defined before options_menu...
 	options_menu.items[1].desc = (char*)core.version;
-	Core_load();
+	if (!Core_load()) goto finish;
 	
 	Input_init(NULL);
 	Config_readOptions(); // but others load and report options later (eg. nes)
